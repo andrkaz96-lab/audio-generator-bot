@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import tempfile
+import time
 from typing import Awaitable, Callable, TypeVar
 from pathlib import Path
 
@@ -12,8 +13,10 @@ from aiogram.exceptions import TelegramNetworkError
 from aiogram.filters import CommandStart
 from aiogram.types import FSInputFile, Message
 
+from botapp.analytics import EventLogger
 from botapp.config import load_settings
 from botapp.extractors.input_resolver import resolve_input_text
+from botapp.extractors.url_text import extract_url
 from botapp.tts.factory import make_tts_provider
 from botapp.utils.text import split_text_into_chunks
 
@@ -24,6 +27,11 @@ logger = logging.getLogger(__name__)
 
 settings = load_settings()
 tts_provider = make_tts_provider(settings)
+event_logger = EventLogger(
+    api_key=settings.posthog_api_key,
+    host=settings.posthog_host,
+    enabled=settings.analytics_enabled,
+)
 
 dp = Dispatcher()
 T = TypeVar("T")
@@ -43,14 +51,33 @@ async def with_telegram_retries(operation: Callable[[], Awaitable[T]], retries: 
     raise last_error
 
 
+def _distinct_id(message: Message) -> str:
+    user_id = message.from_user.id if message.from_user else 0
+    return str(user_id)
+
+
+def _source_from_start(text: str | None) -> str | None:
+    if not text:
+        return None
+    parts = text.split(maxsplit=1)
+    if len(parts) < 2:
+        return None
+    return parts[1].strip() or None
+
+
 @dp.message(CommandStart())
 async def handle_start(message: Message) -> None:
     await with_telegram_retries(
         lambda: message.answer(
-        "Привет! Пришли текст, ссылку на статью или PDF. "
-        "Я сгенерирую аудио для прослушивания."
-    ),
+            "Привет! Пришли текст, ссылку на статью или PDF. "
+            "Я сгенерирую аудио для прослушивания."
+        ),
         retries=settings.telegram_api_retries,
+    )
+    await event_logger.capture(
+        event="bot_started",
+        distinct_id=_distinct_id(message),
+        properties={"source": _source_from_start(message.text)},
     )
 
 
@@ -62,6 +89,11 @@ async def handle_document(message: Message, bot: Bot) -> None:
             lambda: message.answer("Не удалось прочитать документ."),
             retries=settings.telegram_api_retries,
         )
+        await event_logger.capture(
+            event="error_occurred",
+            distinct_id=_distinct_id(message),
+            properties={"error_type": "DocumentMissing", "step": "document_validation"},
+        )
         return
 
     if not document.file_name or not document.file_name.lower().endswith(".pdf"):
@@ -69,7 +101,22 @@ async def handle_document(message: Message, bot: Bot) -> None:
             lambda: message.answer("Сейчас поддерживается только PDF."),
             retries=settings.telegram_api_retries,
         )
+        await event_logger.capture(
+            event="error_occurred",
+            distinct_id=_distinct_id(message),
+            properties={"error_type": "UnsupportedDocumentType", "step": "document_validation"},
+        )
         return
+
+    await event_logger.capture(
+        event="document_uploaded",
+        distinct_id=_distinct_id(message),
+        properties={
+            "file_type": "pdf",
+            "file_size_kb": round((document.file_size or 0) / 1024, 2),
+            "source": _source_from_start(message.caption),
+        },
+    )
 
     status = await with_telegram_retries(
         lambda: message.answer("Скачиваю PDF и готовлю аудио..."),
@@ -89,6 +136,14 @@ async def handle_document(message: Message, bot: Bot) -> None:
 
 @dp.message(F.text)
 async def handle_text(message: Message) -> None:
+    maybe_url = extract_url(message.text or "")
+    if maybe_url:
+        await event_logger.capture(
+            event="link_submitted",
+            distinct_id=_distinct_id(message),
+            properties={"source": _source_from_start(message.text)},
+        )
+
     status = await with_telegram_retries(
         lambda: message.answer("Готовлю текст и синтезирую аудио..."),
         retries=settings.telegram_api_retries,
@@ -107,6 +162,7 @@ async def _generate_and_send_audio(
     raw_text: str | None,
     pdf_path: Path | None,
 ) -> None:
+    started_at = time.perf_counter()
     try:
         resolved = await resolve_input_text(
             raw_text=raw_text,
@@ -120,13 +176,29 @@ async def _generate_and_send_audio(
                 lambda: status_message.edit_text("Не удалось извлечь текст. Пришли другой источник."),
                 retries=settings.telegram_api_retries,
             )
+            await event_logger.capture(
+                event="error_occurred",
+                distinct_id=_distinct_id(message),
+                properties={"error_type": "EmptyResolvedText", "step": "extract_text", "source": resolved.source},
+            )
             return
+
+        await event_logger.capture(
+            event="audio_generation_started",
+            distinct_id=_distinct_id(message),
+            properties={"char_count": len(text), "source": resolved.source},
+        )
 
         chunks = split_text_into_chunks(text, settings.max_chars_per_chunk)
         if not chunks:
             await with_telegram_retries(
                 lambda: status_message.edit_text("Текст пустой после обработки."),
                 retries=settings.telegram_api_retries,
+            )
+            await event_logger.capture(
+                event="error_occurred",
+                distinct_id=_distinct_id(message),
+                properties={"error_type": "EmptyChunks", "step": "split_text", "source": resolved.source},
             )
             return
 
@@ -139,6 +211,18 @@ async def _generate_and_send_audio(
             audio_parts.append(await tts_provider.synthesize(chunk))
 
         output = b"".join(audio_parts)
+        processing_time = round(time.perf_counter() - started_at, 3)
+
+        await event_logger.capture(
+            event="audio_generated",
+            distinct_id=_distinct_id(message),
+            properties={
+                "duration_sec": 0,
+                "char_count": len(text),
+                "processing_time_sec": processing_time,
+                "source": resolved.source,
+            },
+        )
 
         with tempfile.TemporaryDirectory() as tmpdir:
             out_path = Path(tmpdir) / "speech.mp3"
@@ -151,6 +235,12 @@ async def _generate_and_send_audio(
                 retries=settings.telegram_api_retries,
             )
 
+        await event_logger.capture(
+            event="audio_downloaded",
+            distinct_id=_distinct_id(message),
+            properties={"source": resolved.source},
+        )
+
         await with_telegram_retries(
             lambda: status_message.delete(),
             retries=settings.telegram_api_retries,
@@ -158,6 +248,11 @@ async def _generate_and_send_audio(
 
     except Exception as exc:
         logger.exception("Failed to generate audio")
+        await event_logger.capture(
+            event="error_occurred",
+            distinct_id=_distinct_id(message),
+            properties={"error_type": type(exc).__name__, "step": "pipeline"},
+        )
         await with_telegram_retries(
             lambda: status_message.edit_text(f"Ошибка: {type(exc).__name__}: {exc}"),
             retries=settings.telegram_api_retries,

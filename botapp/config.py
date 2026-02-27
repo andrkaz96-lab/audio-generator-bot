@@ -22,6 +22,10 @@ class Settings:
     request_timeout_seconds: int = 20
     telegram_api_timeout_seconds: int = 120
     telegram_api_retries: int = 3
+    posthog_api_key: str = ""
+    posthog_project_id: str = ""
+    posthog_host: str = "https://app.posthog.com"
+    analytics_enabled: bool = True
 
 
 
@@ -44,4 +48,8 @@ def load_settings() -> Settings:
         request_timeout_seconds=int(os.getenv("REQUEST_TIMEOUT_SECONDS", "20")),
         telegram_api_timeout_seconds=int(os.getenv("TELEGRAM_API_TIMEOUT_SECONDS", "120")),
         telegram_api_retries=int(os.getenv("TELEGRAM_API_RETRIES", "3")),
+        posthog_api_key=os.getenv("POSTHOG_API_KEY", "").strip(),
+        posthog_project_id=os.getenv("POSTHOG_PROJECT_ID", "").strip(),
+        posthog_host=os.getenv("POSTHOG_HOST", "https://app.posthog.com").strip(),
+        analytics_enabled=os.getenv("ANALYTICS_ENABLED", "true").strip().lower() in {"1", "true", "yes", "on"},
     )

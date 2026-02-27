@@ -149,6 +149,10 @@ python -m botapp.main
 - `REQUEST_TIMEOUT_SECONDS` — timeout HTTP-запросов для URL/PDF
 - `TELEGRAM_API_TIMEOUT_SECONDS` — timeout Telegram API
 - `TELEGRAM_API_RETRIES` — число retries Telegram API
+- `POSTHOG_API_KEY` — Project API Key (формат `phc_...`)
+- `POSTHOG_PROJECT_ID` — ID проекта PostHog
+- `POSTHOG_HOST` — хост PostHog (обычно `https://app.posthog.com`)
+- `ANALYTICS_ENABLED` — включить аналитику (`true`/`false`)
 
 ## Важные технические нюансы
 
@@ -170,3 +174,191 @@ python -m botapp.main
 ## Следующий этап
 
 После передачи кредов добавляем полноценный `YandexSpeechKitProvider` и готовим деплой в Yandex Cloud.
+
+
+## Обновление бота на Yandex Cloud (VM + systemd)
+
+Ниже — подробная, практическая инструкция именно для вашего кейса:
+- VM доступна по SSH: `ssh -l ubuntu 10.130.0.29`
+- репозиторий: `https://sourcecraft.dev/andrkaz96/audio-generator-bot`
+- `TELEGRAM_BOT_TOKEN` у вас уже есть
+
+### Шаг 0. Что должно быть заранее
+
+На VM должны быть установлены:
+- `git`
+- `python3` и `python3-venv`
+- `systemd` (обычно есть на Ubuntu)
+
+Проверка:
+
+```bash
+git --version
+python3 --version
+systemctl --version
+```
+
+Если чего-то нет:
+
+```bash
+sudo apt update
+sudo apt install -y git python3 python3-venv
+```
+
+### Шаг 1. Подключиться к VM
+
+С вашего локального компьютера:
+
+```bash
+ssh -l ubuntu 10.130.0.29
+```
+
+Что делает команда: открывает SSH-сессию на вашей виртуальной машине под пользователем `ubuntu`.
+
+### Шаг 2. Найти папку, где уже развернут бот
+
+На VM выполните:
+
+```bash
+find /opt /home -maxdepth 3 -type d -name ".git" 2>/dev/null
+```
+
+Что делает команда: ищет git-репозитории в типовых каталогах.
+
+Если репозиторий еще не клонирован, разверните его (пример):
+
+```bash
+sudo mkdir -p /opt/audio-generator-bot
+sudo chown -R "$USER":"$USER" /opt/audio-generator-bot
+git clone https://sourcecraft.dev/andrkaz96/audio-generator-bot /opt/audio-generator-bot
+```
+
+> Если репозиторий приватный и попросит логин/пароль, используйте PAT (Personal Access Token) sourcecraft вместо пароля.
+
+### Шаг 3. Проверить `.env` (самое важное)
+
+Перейдите в папку бота и откройте `.env`:
+
+```bash
+cd /opt/audio-generator-bot
+nano .env
+```
+
+Минимум должно быть:
+
+```env
+TELEGRAM_BOT_TOKEN=<ваш_токен>
+TTS_PROVIDER=silero
+```
+
+Где взять токен, если понадобится заново:
+- открыть `@BotFather` в Telegram
+- выбрать бота → `/token`
+- скопировать новый токен
+
+### Шаг 4. Узнать имя systemd-сервиса бота
+
+Если имя сервиса не помните:
+
+```bash
+systemctl list-units --type=service | grep -i bot
+```
+
+Часто это что-то вроде `tg-audio-bot.service`.
+
+### Шаг 5. Обновить бота до актуального кода из Git
+
+В репозитории запустите скрипт:
+
+```bash
+cd /opt/audio-generator-bot
+chmod +x ./scripts_update_yc_vm.sh
+./scripts_update_yc_vm.sh /opt/audio-generator-bot tg-audio-bot main
+```
+
+Что делает скрипт:
+- `git fetch --all --prune`
+- переключает на нужную ветку
+- делает `git pull --ff-only`
+- проверяет/создает `.venv`
+- обновляет `pip`
+- ставит зависимости `pip install -r requirements.txt`
+- перезапускает systemd-сервис
+- показывает статус сервиса
+
+### Шаг 6. Проверка после обновления
+
+На VM:
+
+```bash
+sudo systemctl status tg-audio-bot --no-pager -l
+journalctl -u tg-audio-bot -n 100 --no-pager
+```
+
+В Telegram:
+- отправить `/start`
+- отправить короткий текст
+- убедиться, что приходит `mp3`
+
+### Какие доступы нужны от вас (если подключаюсь/помогаю удаленно)
+
+- SSH-доступ к VM (`ubuntu@10.130.0.29`)
+- пользователь с правом `sudo systemctl restart <service>`
+- доступ VM к приватному репозиторию (PAT/Deploy key)
+- ваш `TELEGRAM_BOT_TOKEN` в `.env`
+
+### Частые ошибки
+
+- `Permission denied (publickey)` при SSH
+  - не добавлен ваш SSH-ключ в VM
+- `fatal: Authentication failed` при `git pull`
+  - нет/просрочен PAT или не настроен deploy key
+- сервис не стартует после обновления
+  - проверьте логи через `journalctl -u <service> -n 200 --no-pager`
+
+
+## Продуктовая аналитика (PostHog)
+
+В боте добавлен `event_logger`, который отправляет продуктовые события в PostHog.
+
+События MVP:
+- `bot_started`
+- `document_uploaded`
+- `link_submitted`
+- `audio_generation_started`
+- `audio_generated`
+- `audio_downloaded`
+- `error_occurred`
+- `subscription_started` (зарезервировано на будущее)
+
+Обязательные принципы:
+- `distinct_id = telegram user_id`
+- не отправляем персональные данные
+- не отправляем текст документов/сообщений
+- события отправляются как отдельные атомарные capture-события
+
+### Быстрая настройка
+
+1. В `.env` добавить:
+
+```env
+POSTHOG_API_KEY=phc_QULeOM973qkka9xUzmJZMhMiq7VBNIF4x167Up2YdQ2
+POSTHOG_PROJECT_ID=326507
+POSTHOG_HOST=https://app.posthog.com
+ANALYTICS_ENABLED=true
+```
+
+2. Перезапустить бота.
+3. Проверить в PostHog, что появляются события.
+
+### Свойства событий
+
+Для всех событий отправляются:
+- `platform=telegram`
+- `source` (если есть)
+- `distinct_id` (как `user_id` Telegram)
+
+Дополнительно:
+- `document_uploaded`: `file_type`, `file_size_kb`
+- `audio_generated`: `duration_sec`, `char_count`, `processing_time_sec`
+- `error_occurred`: `error_type`, `step`
