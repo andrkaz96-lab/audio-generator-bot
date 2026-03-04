@@ -362,3 +362,34 @@ ANALYTICS_ENABLED=true
 - `document_uploaded`: `file_type`, `file_size_kb`
 - `audio_generated`: `duration_sec`, `char_count`, `processing_time_sec`
 - `error_occurred`: `error_type`, `step`
+
+```
+source .venv/bin/activate
+python -m botapp.main
+```
+
+## Development / Checks
+
+Единая команда локальной проверки:
+
+```bash
+make check
+```
+
+Что входит в `make check`:
+- `make lint` — статический анализ (`ruff check`)
+- `make test` — запуск тестов (`pytest`)
+- `make smoke` — минимальный smoke-импорт ключевых модулей без секретов
+
+Полезные команды:
+
+```bash
+make install   # установить runtime + dev зависимости
+make format    # автоисправления ruff + форматирование
+```
+
+Если CI упал:
+1. Открой лог failing job в GitHub Actions.
+2. Локально повтори ту же команду (обычно `make check` или конкретный target).
+3. Исправь причину падения, закоммить и обнови PR.
+
