@@ -46,6 +46,32 @@ class UrlTextExtractionTests(unittest.TestCase):
         self.assertIn("Компания WMT AI представила обзор", text)
         self.assertNotIn("Подписаться на рассылку", text)
 
+    def test_extract_from_dom_prefers_primary_article_regions(self):
+        html = """
+        <div class="content-grid">
+          <div class="feed-card">
+            <p>Короткая заметка.</p>
+          </div>
+          <div class="feed-card">
+            <p>Еще одна короткая заметка.</p>
+          </div>
+        </div>
+        <main>
+          <h1>Выйти из тени: почему малый и средний бизнес пока осторожничает с ИИ</h1>
+          <p>Генеративный ИИ уже проник в офисы, но не в бизнес-планы. Пока руководители
+             размышляют о стратегиях, сотрудники потихоньку подписываются на ChatGPT.</p>
+          <p>Компания WMT AI представила обзор ситуации на рынке искусственного интеллекта
+             за 2025 год и прогноз на 2026 год. Исследование основано на открытых данных.</p>
+          <p>Ключевые выводы показывают переход ИИ в массовый товар и рост прикладных сценариев.</p>
+        </main>
+        """
+
+        text = _extract_from_dom(html)
+
+        self.assertIn("Выйти из тени", text)
+        self.assertIn("Ключевые выводы", text)
+        self.assertNotIn("Еще одна короткая заметка", text)
+
     def test_extract_from_json_ld_reads_article_body(self):
         html = """
         <html><head>

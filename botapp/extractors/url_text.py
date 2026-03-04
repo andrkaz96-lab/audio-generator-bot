@@ -105,23 +105,7 @@ def _node_score(node: Tag) -> tuple[float, str]:
     return score, text
 
 
-def _extract_from_dom(html: str) -> str:
-    soup = BeautifulSoup(html, "html.parser")
-    _clean_noise(soup)
-
-    selectors = [
-        "article",
-        "main",
-        "[role='main']",
-        "[itemprop='articleBody']",
-        "[class*='article']",
-        "[class*='content']",
-        "[class*='post']",
-        "[class*='entry']",
-        "section",
-        "div",
-    ]
-
+def _best_scored_text(soup: BeautifulSoup, selectors: list[str]) -> str:
     seen: set[int] = set()
     best_text = ""
     best_score = float("-inf")
@@ -137,6 +121,36 @@ def _extract_from_dom(html: str) -> str:
             if score > best_score and text:
                 best_score = score
                 best_text = text
+
+    return best_text
+
+
+def _extract_from_dom(html: str) -> str:
+    soup = BeautifulSoup(html, "html.parser")
+    _clean_noise(soup)
+
+    primary_selectors = [
+        "article",
+        "main",
+        "[role='main']",
+        "[itemprop='articleBody']",
+    ]
+    broad_selectors = [
+        "[class*='article']",
+        "[class*='content']",
+        "[class*='post']",
+        "[class*='entry']",
+        "section",
+        "div",
+    ]
+
+    best_text = _best_scored_text(soup, primary_selectors)
+    if len(best_text) >= _MIN_MEANINGFUL_ARTICLE_LEN:
+        return best_text
+
+    fallback_text = _best_scored_text(soup, broad_selectors)
+    if len(fallback_text) > len(best_text):
+        best_text = fallback_text
 
     if best_text:
         return best_text
