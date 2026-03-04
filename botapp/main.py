@@ -248,13 +248,14 @@ async def _generate_and_send_audio(
 
     except Exception as exc:
         logger.exception("Failed to generate audio")
+        error_text = f"Ошибка: {type(exc).__name__}: {exc}"
         await event_logger.capture(
             event="error_occurred",
             distinct_id=_distinct_id(message),
             properties={"error_type": type(exc).__name__, "step": "pipeline"},
         )
         await with_telegram_retries(
-            lambda: status_message.edit_text(f"Ошибка: {type(exc).__name__}: {exc}"),
+            lambda: status_message.edit_text(error_text),
             retries=settings.telegram_api_retries,
         )
 
