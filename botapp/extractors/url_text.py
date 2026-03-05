@@ -232,6 +232,7 @@ async def fetch_article_text(url: str, timeout_seconds: int = 20) -> str:
     embedded_data_text = _extract_from_embedded_data(html)
 
     candidates = [summary_text, full_dom_text, json_ld_text, embedded_data_text]
+
     text = max(candidates, key=len, default="")
 
     # If extractor returned only a tiny block, keep readability result as backup.

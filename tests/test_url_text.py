@@ -45,7 +45,6 @@ class UrlTextExtractionTests(unittest.TestCase):
         self.assertNotIn("Политика конфиденциальности", text)
 
 
-
     def test_extract_from_embedded_data_joins_paragraph_blocks(self):
         html = """
         <script id="__NEXT_DATA__" type="application/json">
@@ -72,6 +71,7 @@ class UrlTextExtractionTests(unittest.TestCase):
         self.assertIn("Генеративный ИИ уже проник в офисы", text)
         self.assertIn("Малому и среднему бизнесу сложно быстро перестроить процессы", text)
         self.assertIn("По его словам, ИИ действительно сделал знания доступнее", text)
+
 
     def test_extract_from_json_ld_reads_article_body(self):
         html = """
