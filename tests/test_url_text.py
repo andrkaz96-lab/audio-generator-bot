@@ -1,6 +1,10 @@
 import unittest
 
-from botapp.extractors.url_text import _extract_from_dom, _extract_from_json_ld
+from botapp.extractors.url_text import (
+    _extract_from_dom,
+    _extract_from_embedded_data,
+    _extract_from_json_ld,
+)
 
 
 class UrlTextExtractionTests(unittest.TestCase):
@@ -21,6 +25,53 @@ class UrlTextExtractionTests(unittest.TestCase):
         self.assertIn("основной текст статьи", text)
         self.assertNotIn("Купить подписку", text)
         self.assertNotIn("Реклама и служебные", text)
+
+
+    def test_extract_from_dom_prefers_long_article_over_boilerplate_block(self):
+        html = """
+        <main>
+            <p>Компания WMT AI представила обзор ситуации на рынке искусственного интеллекта за 2025 год и прогноз на 2026 год.</p>
+            <p>Исследование основано на открытых данных и анализе глобальных и российских тенденций внедрения ИИ.</p>
+            <p>Главным трендом стало превращение ИИ в массовый товар, где важна не только точность моделей, но и доступность решений.</p>
+        </main>
+        <section class='footer-content'>
+            Политика конфиденциальности, cookies, подписка, реклама и служебная информация сайта.
+        </section>
+        """
+
+        text = _extract_from_dom(html)
+
+        self.assertIn("Компания WMT AI представила обзор", text)
+        self.assertNotIn("Политика конфиденциальности", text)
+
+
+
+    def test_extract_from_embedded_data_joins_paragraph_blocks(self):
+        html = """
+        <script id="__NEXT_DATA__" type="application/json">
+        {
+          "props": {
+            "pageProps": {
+              "article": {
+                "title": "Выйти из тени: почему малый и средний бизнес пока осторожничает с ИИ",
+                "contentBlocks": [
+                  {"type": "paragraph", "text": "Генеративный ИИ уже проник в офисы, но не в бизнес-планы. Пока руководители размышляют о стратегиях, сотрудники потихоньку подписываются на ChatGPT и автоматизируют рутину."},
+                  {"type": "paragraph", "text": "Малому и среднему бизнесу сложно быстро перестроить процессы: не хватает внутренних компетенций и понятных метрик эффекта от внедрения."},
+                  {"type": "paragraph", "text": "По его словам, ИИ действительно сделал знания доступнее. Но знать и уметь — разные вещи. Самостоятельно с ИИ сложно выстроить программу и довести обучение до результата."}
+                ],
+                "footer": "Политика конфиденциальности и cookies"
+              }
+            }
+          }
+        }
+        </script>
+        """
+
+        text = _extract_from_embedded_data(html)
+
+        self.assertIn("Генеративный ИИ уже проник в офисы", text)
+        self.assertIn("Малому и среднему бизнесу сложно быстро перестроить процессы", text)
+        self.assertIn("По его словам, ИИ действительно сделал знания доступнее", text)
 
     def test_extract_from_json_ld_reads_article_body(self):
         html = """
