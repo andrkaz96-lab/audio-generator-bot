@@ -11,6 +11,11 @@ from readability import Document
 
 _URL_RE = re.compile(r"https?://\S+", re.IGNORECASE)
 _MIN_MEANINGFUL_ARTICLE_LEN = 500
+_BOILERPLATE_RE = re.compile(
+    r"(подписк|cookies|политик[аеи]|copyright|все права защищены|"
+    r"поделиться|комментар|реклам|подвал|навигац)",
+    re.IGNORECASE,
+)
 
 
 def _normalize_text(text: str) -> str:
@@ -46,28 +51,73 @@ def _extract_from_json_ld(html: str) -> str:
 
 def _extract_from_dom(main_html: str) -> str:
     soup = BeautifulSoup(main_html, "html.parser")
-    for noise in soup.select("script, style, noscript, nav, footer, aside, form, iframe"):
+    for noise in soup.select("script, style, noscript, nav, footer, aside, form, iframe, header"):
+        noise.decompose()
+
+    for noise in soup.select(
+        "[class*='nav'], [class*='menu'], [class*='footer'], [class*='header'], "
+        "[class*='share'], [class*='comment'], [class*='cookie'], [class*='banner'], "
+        "[id*='nav'], [id*='menu'], [id*='footer'], [id*='header'], [id*='share'], [id*='comment']"
+    ):
         noise.decompose()
 
     selectors = [
         "article",
+        "main",
+        "[role='main']",
         "[itemprop='articleBody']",
         ".article__body",
         ".article-body",
+        ".article-content",
         ".post-content",
         ".entry-content",
+        ".content",
+        ".post",
     ]
+
+    def node_to_text(node: BeautifulSoup) -> str:
+        paragraphs = [
+            _normalize_text(p.get_text(" ", strip=True))
+            for p in node.select("p, h1, h2, h3, li")
+            if p.get_text(strip=True)
+        ]
+        if paragraphs:
+            return _normalize_text(" ".join(paragraphs))
+        return _normalize_text(node.get_text(" ", strip=True))
 
     chunks: list[str] = []
     for selector in selectors:
         for node in soup.select(selector):
-            chunks.append(_normalize_text(node.get_text(" ", strip=True)))
+            chunk = node_to_text(node)
+            if chunk:
+                chunks.append(chunk)
 
-    # Fallback to full content if no well-known container matched.
+    parent_scores: dict[object, int] = {}
+    for p in soup.select("p"):
+        p_text = _normalize_text(p.get_text(" ", strip=True))
+        if len(p_text) < 60:
+            continue
+        parent = p.parent
+        if parent is None:
+            continue
+        parent_scores[parent] = parent_scores.get(parent, 0) + len(p_text)
+
+    if parent_scores:
+        best_parent = max(parent_scores.items(), key=lambda item: item[1])[0]
+        parent_chunk = node_to_text(best_parent)
+        if parent_chunk:
+            chunks.append(parent_chunk)
+
+    # Fallback to body content if no well-known container matched.
     if not chunks:
-        chunks.append(_normalize_text(soup.get_text(" ", strip=True)))
+        body = soup.body or soup
+        chunks.append(_normalize_text(body.get_text(" ", strip=True)))
 
-    return max(chunks, key=len, default="")
+    def score(chunk: str) -> float:
+        penalty = 0.5 if _BOILERPLATE_RE.search(chunk) else 1.0
+        return len(chunk) * penalty
+
+    return max(chunks, key=score, default="")
 
 
 
@@ -106,11 +156,16 @@ async def fetch_article_text(url: str, timeout_seconds: int = 20) -> str:
     title = doc.title() or ""
     main_html = doc.summary(html_partial=True)
 
-    text = _extract_from_dom(main_html)
-    if len(text) < _MIN_MEANINGFUL_ARTICLE_LEN:
-        json_ld_text = _extract_from_json_ld(html)
-        if len(json_ld_text) > len(text):
-            text = json_ld_text
+    summary_text = _extract_from_dom(main_html)
+    full_dom_text = _extract_from_dom(html)
+    json_ld_text = _extract_from_json_ld(html)
+
+    candidates = [summary_text, full_dom_text, json_ld_text]
+    text = max(candidates, key=len, default="")
+
+    # If extractor returned only a tiny block, keep readability result as backup.
+    if len(text) < _MIN_MEANINGFUL_ARTICLE_LEN and len(summary_text) > len(text):
+        text = summary_text
 
     if title and title not in text:
         text = f"{title}. {text}"
