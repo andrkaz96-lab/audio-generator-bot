@@ -3,7 +3,6 @@ from __future__ import annotations
 import re
 import json
 from urllib.parse import urlparse
-
 import httpx
 from bs4 import BeautifulSoup
 from readability import Document
@@ -48,6 +47,77 @@ def _extract_from_json_ld(html: str) -> str:
 
     return max(candidates, key=len, default="")
 
+
+
+
+def _normalize_embedded_text(value: str) -> str:
+    cleaned = _normalize_text(value)
+    if "<" in cleaned and ">" in cleaned:
+        cleaned = _normalize_text(BeautifulSoup(cleaned, "html.parser").get_text(" ", strip=True))
+    return cleaned
+
+
+def _looks_like_article_text(value: str) -> bool:
+    if len(value) < 140:
+        return False
+    if value.count(" ") < 20:
+        return False
+    return True
+
+
+def _extract_from_embedded_data(html: str) -> str:
+    soup = BeautifulSoup(html, "html.parser")
+    candidates: list[str] = []
+
+    def add_candidate(raw: str) -> None:
+        normalized = _normalize_embedded_text(raw)
+        if _looks_like_article_text(normalized):
+            candidates.append(normalized)
+
+    def walk(obj: object) -> None:
+        if isinstance(obj, dict):
+            for key, value in obj.items():
+                if isinstance(value, str) and any(
+                    token in key.lower()
+                    for token in ("article", "content", "body", "text", "html", "paragraph", "rendered")
+                ):
+                    add_candidate(value)
+                walk(value)
+        elif isinstance(obj, list):
+            joined_text_chunks: list[str] = []
+            for item in obj:
+                if isinstance(item, str):
+                    normalized = _normalize_embedded_text(item)
+                    if len(normalized) >= 60:
+                        joined_text_chunks.append(normalized)
+                elif isinstance(item, dict):
+                    text_value = item.get("text")
+                    if isinstance(text_value, str):
+                        normalized = _normalize_embedded_text(text_value)
+                        if len(normalized) >= 60:
+                            joined_text_chunks.append(normalized)
+                walk(item)
+            if len(joined_text_chunks) >= 2:
+                add_candidate(" ".join(joined_text_chunks))
+        elif isinstance(obj, str):
+            add_candidate(obj)
+
+    for script in soup.find_all("script"):
+        script_id = (script.get("id") or "").lower()
+        script_type = (script.get("type") or "").lower()
+        raw = script.string or script.get_text() or ""
+        if not raw.strip():
+            continue
+        is_json_like = "json" in script_type or script_id in {"__next_data__", "__nuxt"}
+        if not is_json_like:
+            continue
+        try:
+            payload = json.loads(raw)
+        except json.JSONDecodeError:
+            continue
+        walk(payload)
+
+    return max(candidates, key=len, default="")
 
 def _extract_from_dom(main_html: str) -> str:
     soup = BeautifulSoup(main_html, "html.parser")
@@ -159,8 +229,10 @@ async def fetch_article_text(url: str, timeout_seconds: int = 20) -> str:
     summary_text = _extract_from_dom(main_html)
     full_dom_text = _extract_from_dom(html)
     json_ld_text = _extract_from_json_ld(html)
+    embedded_data_text = _extract_from_embedded_data(html)
 
-    candidates = [summary_text, full_dom_text, json_ld_text]
+    candidates = [summary_text, full_dom_text, json_ld_text, embedded_data_text]
+
     text = max(candidates, key=len, default="")
 
     # If extractor returned only a tiny block, keep readability result as backup.

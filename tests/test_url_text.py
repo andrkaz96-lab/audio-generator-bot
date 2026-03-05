@@ -1,6 +1,10 @@
 import unittest
 
-from botapp.extractors.url_text import _extract_from_dom, _extract_from_json_ld
+from botapp.extractors.url_text import (
+    _extract_from_dom,
+    _extract_from_embedded_data,
+    _extract_from_json_ld,
+)
 
 
 class UrlTextExtractionTests(unittest.TestCase):
@@ -39,6 +43,35 @@ class UrlTextExtractionTests(unittest.TestCase):
 
         self.assertIn("Компания WMT AI представила обзор", text)
         self.assertNotIn("Политика конфиденциальности", text)
+
+
+    def test_extract_from_embedded_data_joins_paragraph_blocks(self):
+        html = """
+        <script id="__NEXT_DATA__" type="application/json">
+        {
+          "props": {
+            "pageProps": {
+              "article": {
+                "title": "Выйти из тени: почему малый и средний бизнес пока осторожничает с ИИ",
+                "contentBlocks": [
+                  {"type": "paragraph", "text": "Генеративный ИИ уже проник в офисы, но не в бизнес-планы. Пока руководители размышляют о стратегиях, сотрудники потихоньку подписываются на ChatGPT и автоматизируют рутину."},
+                  {"type": "paragraph", "text": "Малому и среднему бизнесу сложно быстро перестроить процессы: не хватает внутренних компетенций и понятных метрик эффекта от внедрения."},
+                  {"type": "paragraph", "text": "По его словам, ИИ действительно сделал знания доступнее. Но знать и уметь — разные вещи. Самостоятельно с ИИ сложно выстроить программу и довести обучение до результата."}
+                ],
+                "footer": "Политика конфиденциальности и cookies"
+              }
+            }
+          }
+        }
+        </script>
+        """
+
+        text = _extract_from_embedded_data(html)
+
+        self.assertIn("Генеративный ИИ уже проник в офисы", text)
+        self.assertIn("Малому и среднему бизнесу сложно быстро перестроить процессы", text)
+        self.assertIn("По его словам, ИИ действительно сделал знания доступнее", text)
+
 
     def test_extract_from_json_ld_reads_article_body(self):
         html = """
