@@ -22,6 +22,24 @@ class UrlTextExtractionTests(unittest.TestCase):
         self.assertNotIn("Купить подписку", text)
         self.assertNotIn("Реклама и служебные", text)
 
+
+    def test_extract_from_dom_prefers_long_article_over_boilerplate_block(self):
+        html = """
+        <main>
+            <p>Компания WMT AI представила обзор ситуации на рынке искусственного интеллекта за 2025 год и прогноз на 2026 год.</p>
+            <p>Исследование основано на открытых данных и анализе глобальных и российских тенденций внедрения ИИ.</p>
+            <p>Главным трендом стало превращение ИИ в массовый товар, где важна не только точность моделей, но и доступность решений.</p>
+        </main>
+        <section class='footer-content'>
+            Политика конфиденциальности, cookies, подписка, реклама и служебная информация сайта.
+        </section>
+        """
+
+        text = _extract_from_dom(html)
+
+        self.assertIn("Компания WMT AI представила обзор", text)
+        self.assertNotIn("Политика конфиденциальности", text)
+
     def test_extract_from_json_ld_reads_article_body(self):
         html = """
         <html><head>
