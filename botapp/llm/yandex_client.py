@@ -6,7 +6,7 @@ from dataclasses import dataclass
 
 import httpx
 
-from botapp.llm.prompts import SYSTEM_PROMPT, build_user_prompt
+from botapp.llm.prompts import build_user_prompt, system_prompt_for_mode
 
 
 RETRYABLE_STATUS_CODES = {429, 500, 502, 503, 504}
@@ -63,8 +63,10 @@ class YandexLLMClient:
         title: str | None,
         body_text: str,
         source_url: str | None,
+        mode: str = "near_verbatim",
     ) -> LLMCallResult:
-        user_prompt = build_user_prompt(title=title, body_text=body_text, source_url=source_url)
+        system_prompt = system_prompt_for_mode(mode)
+        user_prompt = build_user_prompt(title=title, body_text=body_text, source_url=source_url, mode=mode)
         payload = {
             "modelUri": self.model_uri,
             "completionOptions": {
@@ -73,7 +75,7 @@ class YandexLLMClient:
                 "maxTokens": "7000",
             },
             "messages": [
-                {"role": "system", "text": SYSTEM_PROMPT},
+                {"role": "system", "text": system_prompt},
                 {"role": "user", "text": user_prompt},
             ],
         }
@@ -84,7 +86,7 @@ class YandexLLMClient:
             "Content-Type": "application/json",
         }
 
-        prompt_tokens = estimate_tokens(SYSTEM_PROMPT + "\n" + user_prompt)
+        prompt_tokens = estimate_tokens(system_prompt + "\n" + user_prompt)
         request_started = time.perf_counter()
         last_error: str | None = None
 

@@ -61,6 +61,7 @@ class ArticleLLMService:
         title: str | None,
         body_text: str,
         source_url: str | None = None,
+        mode: str = "near_verbatim",
     ) -> ArticleTTSResult:
         body = self._cleanup_body(body_text)
         fallback_text = self._assemble_text(title, body)
@@ -92,7 +93,12 @@ class ArticleLLMService:
 
         for index, chunk in enumerate(chunks):
             chunk_title = title if index == 0 else None
-            chunk_result = await self.client.normalize_article(title=chunk_title, body_text=chunk, source_url=source_url)
+            chunk_result = await self.client.normalize_article(
+                title=chunk_title,
+                body_text=chunk,
+                source_url=source_url,
+                mode=mode,
+            )
             prompt_tokens += chunk_result.estimated_prompt_tokens
             completion_tokens += chunk_result.estimated_completion_tokens
             latency_ms += chunk_result.latency_ms

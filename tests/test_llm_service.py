@@ -11,8 +11,8 @@ class DummyClient:
         self.calls = []
         self.model_uri = "gpt://folder/yandexgpt-lite"
 
-    async def normalize_article(self, *, title, body_text, source_url):
-        self.calls.append((title, body_text, source_url))
+    async def normalize_article(self, *, title, body_text, source_url, mode="near_verbatim"):
+        self.calls.append((title, body_text, source_url, mode))
         result = self.results.pop(0)
         return result
 

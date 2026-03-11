@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import asyncio
-import json
 import logging
 import tempfile
 import time
@@ -12,11 +11,12 @@ from aiogram import Bot, Dispatcher, F
 from aiogram.client.session.aiohttp import AiohttpSession
 from aiogram.exceptions import TelegramNetworkError
 from aiogram.filters import CommandStart
-from aiogram.types import FSInputFile, Message
+from aiogram.types import FSInputFile, KeyboardButton, Message, ReplyKeyboardMarkup, ReplyKeyboardRemove
 
 from botapp.analytics import EventLogger
 from botapp.config import load_settings
 from botapp.extractors.input_resolver import resolve_input_text
+from botapp.extractors.article_pipeline import ArticleMode, run_article_pipeline
 from botapp.extractors.url_text import extract_url
 from botapp.llm.service import ArticleLLMService
 from botapp.llm.yandex_client import YandexLLMClient
@@ -56,6 +56,13 @@ llm_service = ArticleLLMService(
 
 dp = Dispatcher()
 T = TypeVar("T")
+MODE_NEAR_VERBATIM = "near_verbatim"
+MODE_READABLE_CLEANED = "readable_cleaned"
+MODE_BUTTON_TO_VALUE: dict[str, ArticleMode] = {
+    "🧾 Почти дословно": MODE_NEAR_VERBATIM,
+    "🎧 Чистый для озвучки": MODE_READABLE_CLEANED,
+}
+_pending_url_by_user: dict[int, str] = {}
 
 
 async def with_telegram_retries(operation: Callable[[], Awaitable[T]], retries: int) -> T:
@@ -159,11 +166,45 @@ async def handle_document(message: Message, bot: Bot) -> None:
 async def handle_text(message: Message) -> None:
     maybe_url = extract_url(message.text or "")
     if maybe_url:
+        user_id = message.from_user.id if message.from_user else 0
+        _pending_url_by_user[user_id] = maybe_url
+        keyboard = ReplyKeyboardMarkup(
+            keyboard=[[KeyboardButton(text=label)] for label in MODE_BUTTON_TO_VALUE],
+            resize_keyboard=True,
+            one_time_keyboard=True,
+        )
+        await with_telegram_retries(
+            lambda: message.answer(
+                "Выбери режим обработки ссылки:\n"
+                "🧾 Почти дословно — near-verbatim\n"
+                "🎧 Чистый для озвучки — readable cleaned",
+                reply_markup=keyboard,
+            ),
+            retries=settings.telegram_api_retries,
+        )
         await event_logger.capture(
             event="link_submitted",
             distinct_id=_distinct_id(message),
             properties={"source": _source_from_start(message.text)},
         )
+        return
+
+    mode = MODE_BUTTON_TO_VALUE.get((message.text or "").strip())
+    if mode and message.from_user:
+        pending_url = _pending_url_by_user.pop(message.from_user.id, None)
+        if pending_url:
+            status = await with_telegram_retries(
+                lambda: message.answer("Извлекаю статью и синтезирую аудио...", reply_markup=ReplyKeyboardRemove()),
+                retries=settings.telegram_api_retries,
+            )
+            await _generate_and_send_audio(
+                message=message,
+                status_message=status,
+                raw_text=pending_url,
+                pdf_path=None,
+                url_mode=mode,
+            )
+            return
 
     status = await with_telegram_retries(
         lambda: message.answer("Готовлю текст и синтезирую аудио..."),
@@ -174,6 +215,7 @@ async def handle_text(message: Message) -> None:
         status_message=status,
         raw_text=message.text,
         pdf_path=None,
+        url_mode=MODE_NEAR_VERBATIM,
     )
 
 
@@ -182,83 +224,40 @@ async def _generate_and_send_audio(
     status_message: Message,
     raw_text: str | None,
     pdf_path: Path | None,
+    url_mode: ArticleMode = MODE_NEAR_VERBATIM,
 ) -> None:
     started_at = time.perf_counter()
     try:
-        resolved = await resolve_input_text(
-            raw_text=raw_text,
-            pdf_local_path=pdf_path,
-            timeout_seconds=settings.request_timeout_seconds,
-        )
-
-        text = resolved.text[: settings.max_input_chars]
-        if resolved.source == "url":
+        maybe_url = extract_url(raw_text or "")
+        if maybe_url and pdf_path is None:
+            pipeline_result = await run_article_pipeline(
+                url=maybe_url,
+                mode=url_mode,
+                timeout_seconds=settings.request_timeout_seconds,
+                llm_service=llm_service,
+            )
+            text = pipeline_result.text[: settings.max_input_chars]
+            resolved_source = "url"
             await event_logger.capture(
-                event="llm request_sent",
+                event="url_pipeline_completed",
                 distinct_id=_distinct_id(message),
-                properties={"flow": "article_to_tts", "source_type": "url", "provider": settings.llm_provider},
+                properties={
+                    "mode": pipeline_result.mode,
+                    "quality_score": pipeline_result.quality_report.quality_score,
+                    "decision": pipeline_result.quality_report.decision,
+                    "llm_used": pipeline_result.processing_trace.llm_used,
+                    "flags": ",".join(pipeline_result.quality_report.flags),
+                    "warnings": ",".join(pipeline_result.warnings),
+                },
             )
-            result = await llm_service.build_tts_text_for_article(
-                title=resolved.title,
-                body_text=resolved.body_text or text,
-                source_url=resolved.source_url,
+        else:
+            resolved = await resolve_input_text(
+                raw_text=raw_text,
+                pdf_local_path=pdf_path,
+                timeout_seconds=settings.request_timeout_seconds,
             )
-            text = result.final_text
-            analytics_payload = llm_service.analytics_properties(
-                result=result,
-                title=resolved.title,
-                source_url=resolved.source_url,
-                user_id=message.from_user.id if message.from_user else None,
-                chat_id=message.chat.id if message.chat else None,
-            )
-            await event_logger.capture(
-                event="llm response_received" if result.success else "llm request_failed",
-                distinct_id=_distinct_id(message),
-                properties=analytics_payload,
-            )
-            logger.info(
-                json.dumps(
-                    {
-                        "event_name": "llm_article_processed",
-                        "request_id": str(message.message_id),
-                        "provider": result.provider,
-                        "model_uri": result.model_uri,
-                        "source_type": "url",
-                        "source_url": resolved.source_url,
-                        "user_id": message.from_user.id if message.from_user else None,
-                        "chat_id": message.chat.id if message.chat else None,
-                        "input_chars": result.input_chars,
-                        "output_chars": result.output_chars,
-                        "input_paragraphs": result.input_paragraphs,
-                        "output_paragraphs": result.output_paragraphs,
-                        "was_chunked": result.was_chunked,
-                        "chunk_count": result.chunk_count,
-                        "was_truncated": result.was_truncated,
-                        "latency_ms": result.latency_ms,
-                        "success": result.success,
-                        "error_type": result.error_type,
-                        "retry_count": result.retry_count,
-                        "estimated_prompt_tokens": result.estimated_prompt_tokens,
-                        "estimated_completion_tokens": result.estimated_completion_tokens,
-                    },
-                    ensure_ascii=False,
-                )
-            )
-
-            if settings.llm_debug_send_text_file:
-                with tempfile.TemporaryDirectory() as tmpdir:
-                    name = f"article_tts_text_{message.message_id or int(time.time())}.txt"
-                    text_path = Path(tmpdir) / name
-                    text_path.write_text(text, encoding="utf-8")
-                    await with_telegram_retries(
-                        lambda: message.answer_document(document=FSInputFile(text_path), caption="Отладочный текст для TTS."),
-                        retries=settings.telegram_api_retries,
-                    )
-                await event_logger.capture(
-                    event="llm debug_text_file_sent",
-                    distinct_id=_distinct_id(message),
-                    properties=analytics_payload,
-                )
+            text = resolved.text[: settings.max_input_chars]
+            resolved_source = resolved.source
 
         if not text:
             await with_telegram_retries(
@@ -268,14 +267,14 @@ async def _generate_and_send_audio(
             await event_logger.capture(
                 event="error_occurred",
                 distinct_id=_distinct_id(message),
-                properties={"error_type": "EmptyResolvedText", "step": "extract_text", "source": resolved.source},
+                properties={"error_type": "EmptyResolvedText", "step": "extract_text", "source": resolved_source},
             )
             return
 
         await event_logger.capture(
             event="audio_generation_started",
             distinct_id=_distinct_id(message),
-            properties={"char_count": len(text), "source": resolved.source},
+            properties={"char_count": len(text), "source": resolved_source},
         )
 
         chunks = split_text_into_chunks(text, settings.max_chars_per_chunk)
@@ -287,7 +286,7 @@ async def _generate_and_send_audio(
             await event_logger.capture(
                 event="error_occurred",
                 distinct_id=_distinct_id(message),
-                properties={"error_type": "EmptyChunks", "step": "split_text", "source": resolved.source},
+                properties={"error_type": "EmptyChunks", "step": "split_text", "source": resolved_source},
             )
             return
 
@@ -309,10 +308,10 @@ async def _generate_and_send_audio(
                 "duration_sec": 0,
                 "char_count": len(text),
                 "processing_time_sec": processing_time,
-                "source": resolved.source,
+                "source": resolved_source,
             },
         )
-        if resolved.source == "url":
+        if resolved_source == "url":
             await event_logger.capture(
                 event="llm output_sent_to_tts",
                 distinct_id=_distinct_id(message),
@@ -325,7 +324,7 @@ async def _generate_and_send_audio(
             await with_telegram_retries(
                 lambda: message.answer_audio(
                     audio=FSInputFile(out_path),
-                    caption=f"Готово. Источник: {resolved.source}. Длина текста: {len(text)} символов.",
+                    caption=f"Готово. Источник: {resolved_source}. Длина текста: {len(text)} символов.",
                 ),
                 retries=settings.telegram_api_retries,
             )
@@ -333,7 +332,7 @@ async def _generate_and_send_audio(
         await event_logger.capture(
             event="audio_downloaded",
             distinct_id=_distinct_id(message),
-            properties={"source": resolved.source},
+            properties={"source": resolved_source},
         )
 
         await with_telegram_retries(
