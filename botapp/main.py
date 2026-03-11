@@ -1,11 +1,12 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import tempfile
 import time
-from typing import Awaitable, Callable, TypeVar
 from pathlib import Path
+from typing import Awaitable, Callable, TypeVar
 
 from aiogram import Bot, Dispatcher, F
 from aiogram.client.session.aiohttp import AiohttpSession
@@ -17,6 +18,8 @@ from botapp.analytics import EventLogger
 from botapp.config import load_settings
 from botapp.extractors.input_resolver import resolve_input_text
 from botapp.extractors.url_text import extract_url
+from botapp.llm.service import ArticleLLMService
+from botapp.llm.yandex_client import YandexLLMClient
 from botapp.tts.factory import make_tts_provider
 from botapp.utils.text import split_text_into_chunks
 
@@ -31,6 +34,24 @@ event_logger = EventLogger(
     api_key=settings.posthog_api_key,
     host=settings.posthog_host,
     enabled=settings.analytics_enabled,
+)
+llm_client = (
+    YandexLLMClient(
+        api_key=settings.yandex_api_key,
+        folder_id=settings.yandex_folder_id,
+        api_base=settings.yandex_api_base,
+        timeout_seconds=settings.llm_timeout_seconds,
+    )
+    if settings.yandex_api_key
+    else None
+)
+llm_service = ArticleLLMService(
+    enabled=settings.llm_enabled,
+    provider=settings.llm_provider,
+    model=settings.yandex_model,
+    max_input_chars=settings.llm_max_input_chars,
+    log_prompts=settings.llm_log_prompts,
+    client=llm_client,
 )
 
 dp = Dispatcher()
@@ -171,6 +192,74 @@ async def _generate_and_send_audio(
         )
 
         text = resolved.text[: settings.max_input_chars]
+        if resolved.source == "url":
+            await event_logger.capture(
+                event="llm request_sent",
+                distinct_id=_distinct_id(message),
+                properties={"flow": "article_to_tts", "source_type": "url", "provider": settings.llm_provider},
+            )
+            result = await llm_service.build_tts_text_for_article(
+                title=resolved.title,
+                body_text=resolved.body_text or text,
+                source_url=resolved.source_url,
+            )
+            text = result.final_text
+            analytics_payload = llm_service.analytics_properties(
+                result=result,
+                title=resolved.title,
+                source_url=resolved.source_url,
+                user_id=message.from_user.id if message.from_user else None,
+                chat_id=message.chat.id if message.chat else None,
+            )
+            await event_logger.capture(
+                event="llm response_received" if result.success else "llm request_failed",
+                distinct_id=_distinct_id(message),
+                properties=analytics_payload,
+            )
+            logger.info(
+                json.dumps(
+                    {
+                        "event_name": "llm_article_processed",
+                        "request_id": str(message.message_id),
+                        "provider": result.provider,
+                        "model_uri": result.model_uri,
+                        "source_type": "url",
+                        "source_url": resolved.source_url,
+                        "user_id": message.from_user.id if message.from_user else None,
+                        "chat_id": message.chat.id if message.chat else None,
+                        "input_chars": result.input_chars,
+                        "output_chars": result.output_chars,
+                        "input_paragraphs": result.input_paragraphs,
+                        "output_paragraphs": result.output_paragraphs,
+                        "was_chunked": result.was_chunked,
+                        "chunk_count": result.chunk_count,
+                        "was_truncated": result.was_truncated,
+                        "latency_ms": result.latency_ms,
+                        "success": result.success,
+                        "error_type": result.error_type,
+                        "retry_count": result.retry_count,
+                        "estimated_prompt_tokens": result.estimated_prompt_tokens,
+                        "estimated_completion_tokens": result.estimated_completion_tokens,
+                    },
+                    ensure_ascii=False,
+                )
+            )
+
+            if settings.llm_debug_send_text_file:
+                with tempfile.TemporaryDirectory() as tmpdir:
+                    name = f"article_tts_text_{message.message_id or int(time.time())}.txt"
+                    text_path = Path(tmpdir) / name
+                    text_path.write_text(text, encoding="utf-8")
+                    await with_telegram_retries(
+                        lambda: message.answer_document(document=FSInputFile(text_path), caption="Отладочный текст для TTS."),
+                        retries=settings.telegram_api_retries,
+                    )
+                await event_logger.capture(
+                    event="llm debug_text_file_sent",
+                    distinct_id=_distinct_id(message),
+                    properties=analytics_payload,
+                )
+
         if not text:
             await with_telegram_retries(
                 lambda: status_message.edit_text("Не удалось извлечь текст. Пришли другой источник."),
@@ -223,6 +312,12 @@ async def _generate_and_send_audio(
                 "source": resolved.source,
             },
         )
+        if resolved.source == "url":
+            await event_logger.capture(
+                event="llm output_sent_to_tts",
+                distinct_id=_distinct_id(message),
+                properties={"flow": "article_to_tts", "source_type": "url", "char_count": len(text)},
+            )
 
         with tempfile.TemporaryDirectory() as tmpdir:
             out_path = Path(tmpdir) / "speech.mp3"
@@ -261,7 +356,10 @@ async def _generate_and_send_audio(
 
 
 async def main() -> None:
-    session = AiohttpSession(timeout=float(settings.telegram_api_timeout_seconds))
+    if not settings.telegram_bot_token or ":" not in settings.telegram_bot_token:
+        raise ValueError("Некорректный TELEGRAM_BOT_TOKEN")
+
+    session = AiohttpSession(timeout=settings.telegram_api_timeout_seconds)
     bot = Bot(token=settings.telegram_bot_token, session=session)
     await dp.start_polling(bot)
 

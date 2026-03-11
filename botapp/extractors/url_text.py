@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import re
 import json
+from dataclasses import dataclass
 from urllib.parse import urlparse
 import httpx
 from bs4 import BeautifulSoup
@@ -15,6 +16,13 @@ _BOILERPLATE_RE = re.compile(
     r"поделиться|комментар|реклам|подвал|навигац)",
     re.IGNORECASE,
 )
+
+
+@dataclass(frozen=True)
+class ArticleContent:
+    title: str
+    body_text: str
+    full_text: str
 
 
 def _normalize_text(text: str) -> str:
@@ -205,6 +213,11 @@ def extract_url(text: str) -> str | None:
 
 
 async def fetch_article_text(url: str, timeout_seconds: int = 20) -> str:
+    content = await fetch_article_content(url, timeout_seconds=timeout_seconds)
+    return content.full_text
+
+
+async def fetch_article_content(url: str, timeout_seconds: int = 20) -> ArticleContent:
     headers = {
         "User-Agent": (
             "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
@@ -239,7 +252,16 @@ async def fetch_article_text(url: str, timeout_seconds: int = 20) -> str:
     if len(text) < _MIN_MEANINGFUL_ARTICLE_LEN and len(summary_text) > len(text):
         text = summary_text
 
-    if title and title not in text:
-        text = f"{title}. {text}"
+    normalized_title = _normalize_text(title)
+    if normalized_title and normalized_title in text:
+        body_text = text.replace(normalized_title, "", 1).strip(" .")
+    else:
+        body_text = text
 
-    return _normalize_text(text)
+    full_text = f"{normalized_title}\n\n{body_text}".strip() if normalized_title else body_text
+
+    return ArticleContent(
+        title=normalized_title,
+        body_text=_normalize_text(body_text),
+        full_text=_normalize_text(full_text),
+    )

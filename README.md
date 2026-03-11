@@ -1,395 +1,121 @@
-# Telegram TTS Bot (local MVP)
+# Telegram TTS Bot
 
-Локальный Telegram-бот на Python, который принимает вход в одном из форматов:
-- обычный текст
-- ссылка на статью
-- PDF-файл (документом в чат)
-- ссылка на PDF
+Бот принимает текст, ссылку на статью или PDF.
+На выходе отправляет mp3.
 
-На выходе бот отправляет `mp3`-аудио, пригодное для прослушивания в дороге.
+## 1) Что изменилось
 
-## Текущий статус
+- Для ссылок на статьи добавлен безопасный слой YandexGPT Lite.
+- LLM теперь делает только легкую нормализацию текста для TTS.
+- Добавлен безопасный fallback: если LLM не отвечает, аудио все равно генерируется.
+- Добавлен debug `.txt` файл с точным текстом, который уходит в TTS.
+- Добавлены события аналитики по LLM-процессу.
 
-- Основной TTS: `silero` (open-source, локально на CPU)
-- Авто-fallback: `gtts`, если `silero` недоступен (например, временно не скачались веса)
-- Telegram API: увеличенный timeout + retry
-- Yandex SpeechKit: пока заглушка (подключается после передачи кредов)
+## 2) Как теперь работает обработка ссылок на статьи
 
-## Архитектура решения
+1. Бот находит URL.
+2. Существующий extractor достает **заголовок** и **основной текст** статьи.
+3. LLM-сервис получает эти данные и пытается убрать только явный мусор.
+4. Итоговый формат всегда одинаковый:
+   - заголовок
+   - пустая строка
+   - полный основной текст статьи
+5. Этот же итоговый текст отправляется в TTS.
 
-1. Telegram update приходит в `botapp.main`.
-2. Определяется источник текста: `text` / `url` / `pdf`.
-3. Текст нормализуется и режется на чанки.
-4. Для каждого чанка вызывается TTS-провайдер.
-5. Аудио-чанки склеиваются и отправляются пользователю как `mp3`.
+## 3) Зачем добавили YandexGPT
 
-## Ключевые компоненты и функции
+Чтобы мягко почистить текст перед озвучкой:
+- убрать cookie/subscribe/share мусор,
+- убрать дублирующийся boilerplate,
+- улучшить читаемость без потери смысла.
 
-### Оркестрация бота
+## 4) Что делает LLM, а что extractor
 
-- `botapp/main.py`
-- `main()`
-  - создает `Bot` и запускает polling
-- `handle_start()`
-  - обработчик `/start`
-- `handle_document()`
-  - обработка PDF-документа из Telegram
-- `handle_text()`
-  - обработка текстового сообщения
-- `_generate_and_send_audio()`
-  - общий pipeline: извлечение текста -> чанки -> синтез -> отправка аудио
-- `with_telegram_retries()`
-  - retry-обертка для вызовов Telegram API при сетевых сбоях
+**Extractor — источник правды по контенту статьи.**
 
-### Конфигурация
+Extractor:
+- получает title и body из страницы.
 
-- `botapp/config.py`
-- `Settings`
-  - единая структура всех runtime-параметров
-- `load_settings()`
-  - загрузка и валидация env-переменных
+LLM:
+- не суммирует,
+- не сокращает,
+- не добавляет факты,
+- не превращает текст в «креатив».
 
-### Извлечение текста
+LLM делает только нормализацию в пределах уже извлеченного текста.
 
-- `botapp/extractors/input_resolver.py`
-- `resolve_input_text()`
-  - выбирает стратегию извлечения в зависимости от входа
+## 5) Что происходит, если LLM недоступна
 
-- `botapp/extractors/url_text.py`
-- `extract_url()`
-  - достает URL из сообщения
-- `fetch_article_text()`
-  - загружает HTML и извлекает основной текст статьи
+Ничего критичного.
+Бот берет детерминированный fallback:
+- title
+- пустая строка
+- body
 
-- `botapp/extractors/pdf_text.py`
-- `extract_pdf_text_from_file()`
-  - извлечение текста из PDF-файла
-- `extract_pdf_text_from_url()`
-  - скачивание PDF по URL + извлечение
-- `extract_pdf_text_from_bytes()`
-  - извлечение из байтов PDF
+И отправляет это в TTS.
 
-### Обработка текста
+## 6) Что такое отладочный txt-файл
 
-- `botapp/utils/text.py`
-- `normalize_text()`
-  - чистит лишние пробелы
-- `split_text_into_chunks()`
-  - делит длинный текст на чанки по `MAX_CHARS_PER_CHUNK`
+Если включен флаг `LLM_DEBUG_SEND_TEXT_FILE=true`, бот отправляет `.txt` в UTF-8.
+Внутри — **точно тот же текст**, который ушел в TTS.
+Это удобно для проверки качества и разборов инцидентов.
 
-### TTS-слой
+## 7) Какие переменные заполнить в `.env`
 
-- `botapp/tts/base.py`
-- `TTSProvider.synthesize()`
-  - единый интерфейс для всех движков
+Обязательные:
+- `TELEGRAM_BOT_TOKEN`
 
-- `botapp/tts/factory.py`
-- `make_tts_provider()`
-  - создает нужный провайдер по `TTS_PROVIDER`
+Для TTS:
+- `TTS_PROVIDER`
+- остальные параметры TTS-провайдера по необходимости
 
-- `botapp/tts/silero_provider.py`
-- `SileroTTSProvider.synthesize()`
-  - локальный синтез через Silero
-- `_ensure_model_loaded()`
-  - lazy-загрузка модели
-- `_split_text()`
-  - внутренняя нарезка для ограничения Silero (~900 символов за вызов)
-- `_encode_mp3()`
-  - кодирование PCM в MP3
+Для LLM:
+- `LLM_ENABLED=true`
+- `LLM_PROVIDER=yandex`
+- `YANDEX_API_KEY=`
+- `YANDEX_FOLDER_ID=` (если пусто, есть fallback `b1geq9r8nerbilj0i53p`)
+- `YANDEX_API_BASE=https://llm.api.cloud.yandex.net/v1`
+- `YANDEX_MODEL=yandexgpt-lite/latest` (используется как конфиг-метка)
+- `LLM_TIMEOUT_SECONDS=30`
+- `LLM_MAX_INPUT_CHARS=18000`
+- `LLM_DEBUG_SEND_TEXT_FILE=true`
+- `LLM_LOG_PROMPTS=false`
 
-- `botapp/tts/fallback_provider.py`
-- `FallbackTTSProvider.synthesize()`
-  - при ошибке primary-провайдера переключает на fallback
+Важно: в API передается не raw `YANDEX_MODEL`, а корректный URI:
+`gpt://{YANDEX_FOLDER_ID}/yandexgpt-lite`.
 
-- `botapp/tts/gtts_provider.py`
-- `GTTSProvider.synthesize()`
-  - fallback-синтез через gTTS
+## 8) Какие события пишутся в аналитику
 
-- `botapp/tts/edge_provider.py`
-- `EdgeTTSProvider.synthesize()`
-  - альтернативный TTS через Edge (может давать 403)
+Стабильные события:
+- `llm request_sent`
+- `llm response_received`
+- `llm request_failed`
+- `llm output_sent_to_tts`
+- `llm debug_text_file_sent`
 
-- `botapp/tts/yandex_provider.py`
-- `YandexSpeechKitProvider`
-  - заглушка до подключения облачных кредов
+Передаются только бизнес-поля и агрегаты.
+Полный текст статьи и полный prompt в аналитику не пишутся.
 
-## Быстрый старт
+## 9) Как контролируем расходы и токены
+
+- Низкая температура (0.1).
+- Ограничение входа: `LLM_MAX_INPUT_CHARS`.
+- Для длинных статей: деление по абзацам с сохранением порядка.
+- Считаем токены оценочно (локальная эвристика).
+- В метаданных есть `estimated_prompt_tokens`, `estimated_completion_tokens`, `estimated_total_tokens`.
+
+## 10) Ограничения и риски
+
+- Оценка токенов не точная, а расчетная.
+- В редких случаях extractor может вернуть шумный текст.
+- LLM может дать неидеальную очистку, но не должна ломать основной сценарий.
+- Критичный риск «потери контента» закрыт fallback-логикой.
+
+## Запуск
 
 ```bash
 python3 -m venv .venv
 source .venv/bin/activate
-python -m pip install --upgrade pip
 pip install -r requirements.txt
-cp .env.example .env
-```
-
-Заполнить минимум:
-- `TELEGRAM_BOT_TOKEN=...`
-- `TTS_PROVIDER=silero`
-
-Запуск:
-
-```bash
-source .venv/bin/activate
 python -m botapp.main
 ```
-
-## .env параметры
-
-- `TELEGRAM_BOT_TOKEN` — токен Telegram-бота
-- `TTS_PROVIDER` — `silero` | `gtts` | `edge` | `yandex`
-- `SILERO_SPEAKER` — голос Silero (`xenia`, `baya`, `aidar`, `kseniya`, `eugene`)
-- `SILERO_SAMPLE_RATE` — sample rate (по умолчанию `48000`)
-- `SILERO_MODEL_LANGUAGE` — язык модели (`ru`)
-- `SILERO_MODEL_SPEAKER` — модель (`v4_ru`)
-- `GTTS_LANG` — язык для gTTS (`ru`)
-- `EDGE_VOICE` — голос Edge TTS
-- `MAX_CHARS_PER_CHUNK` — размер чанка на уровне pipeline (по умолчанию `4000`)
-- `MAX_INPUT_CHARS` — общий лимит входного текста
-- `REQUEST_TIMEOUT_SECONDS` — timeout HTTP-запросов для URL/PDF
-- `TELEGRAM_API_TIMEOUT_SECONDS` — timeout Telegram API
-- `TELEGRAM_API_RETRIES` — число retries Telegram API
-- `POSTHOG_API_KEY` — Project API Key (формат `phc_...`)
-- `POSTHOG_PROJECT_ID` — ID проекта PostHog
-- `POSTHOG_HOST` — хост PostHog (обычно `https://app.posthog.com`)
-- `ANALYTICS_ENABLED` — включить аналитику (`true`/`false`)
-
-## Важные технические нюансы
-
-- Silero может падать на очень длинных строках за один вызов. В провайдере это уже учтено внутренним `_split_text()`.
-- При ошибке загрузки/работы Silero автоматически включается `gtts` fallback.
-- Первый запуск Silero может быть дольше из-за загрузки весов.
-
-## Диагностика типовых проблем
-
-- `TokenValidationError`
-  - проверь формат `TELEGRAM_BOT_TOKEN` (должен содержать `:`)
-- `TelegramNetworkError: Request timeout error`
-  - увеличь `TELEGRAM_API_TIMEOUT_SECONDS` и `TELEGRAM_API_RETRIES`
-- `HTTPError 503` при загрузке Silero
-  - временная проблема внешнего хоста; бот должен переключиться на `gtts`
-- `ModuleNotFoundError`
-  - выполнить `pip install -r requirements.txt` в активированном `.venv`
-
-## Следующий этап
-
-После передачи кредов добавляем полноценный `YandexSpeechKitProvider` и готовим деплой в Yandex Cloud.
-
-
-## Обновление бота на Yandex Cloud (VM + systemd)
-
-Ниже — подробная, практическая инструкция именно для вашего кейса:
-- VM доступна по SSH: `ssh -l ubuntu 10.130.0.29`
-- репозиторий: `https://sourcecraft.dev/andrkaz96/audio-generator-bot`
-- `TELEGRAM_BOT_TOKEN` у вас уже есть
-
-### Шаг 0. Что должно быть заранее
-
-На VM должны быть установлены:
-- `git`
-- `python3` и `python3-venv`
-- `systemd` (обычно есть на Ubuntu)
-
-Проверка:
-
-```bash
-git --version
-python3 --version
-systemctl --version
-```
-
-Если чего-то нет:
-
-```bash
-sudo apt update
-sudo apt install -y git python3 python3-venv
-```
-
-### Шаг 1. Подключиться к VM
-
-С вашего локального компьютера:
-
-```bash
-ssh -l ubuntu 10.130.0.29
-```
-
-Что делает команда: открывает SSH-сессию на вашей виртуальной машине под пользователем `ubuntu`.
-
-### Шаг 2. Найти папку, где уже развернут бот
-
-На VM выполните:
-
-```bash
-find /opt /home -maxdepth 3 -type d -name ".git" 2>/dev/null
-```
-
-Что делает команда: ищет git-репозитории в типовых каталогах.
-
-Если репозиторий еще не клонирован, разверните его (пример):
-
-```bash
-sudo mkdir -p /opt/audio-generator-bot
-sudo chown -R "$USER":"$USER" /opt/audio-generator-bot
-git clone https://sourcecraft.dev/andrkaz96/audio-generator-bot /opt/audio-generator-bot
-```
-
-> Если репозиторий приватный и попросит логин/пароль, используйте PAT (Personal Access Token) sourcecraft вместо пароля.
-
-### Шаг 3. Проверить `.env` (самое важное)
-
-Перейдите в папку бота и откройте `.env`:
-
-```bash
-cd /opt/audio-generator-bot
-nano .env
-```
-
-Минимум должно быть:
-
-```env
-TELEGRAM_BOT_TOKEN=<ваш_токен>
-TTS_PROVIDER=silero
-```
-
-Где взять токен, если понадобится заново:
-- открыть `@BotFather` в Telegram
-- выбрать бота → `/token`
-- скопировать новый токен
-
-### Шаг 4. Узнать имя systemd-сервиса бота
-
-Если имя сервиса не помните:
-
-```bash
-systemctl list-units --type=service | grep -i bot
-```
-
-Часто это что-то вроде `tg-audio-bot.service`.
-
-### Шаг 5. Обновить бота до актуального кода из Git
-
-В репозитории запустите скрипт:
-
-```bash
-cd /opt/audio-generator-bot
-chmod +x ./scripts_update_yc_vm.sh
-./scripts_update_yc_vm.sh /opt/audio-generator-bot tg-audio-bot main
-```
-
-Что делает скрипт:
-- `git fetch --all --prune`
-- переключает на нужную ветку
-- делает `git pull --ff-only`
-- проверяет/создает `.venv`
-- обновляет `pip`
-- ставит зависимости `pip install -r requirements.txt`
-- перезапускает systemd-сервис
-- показывает статус сервиса
-
-### Шаг 6. Проверка после обновления
-
-На VM:
-
-```bash
-sudo systemctl status tg-audio-bot --no-pager -l
-journalctl -u tg-audio-bot -n 100 --no-pager
-```
-
-В Telegram:
-- отправить `/start`
-- отправить короткий текст
-- убедиться, что приходит `mp3`
-
-### Какие доступы нужны от вас (если подключаюсь/помогаю удаленно)
-
-- SSH-доступ к VM (`ubuntu@10.130.0.29`)
-- пользователь с правом `sudo systemctl restart <service>`
-- доступ VM к приватному репозиторию (PAT/Deploy key)
-- ваш `TELEGRAM_BOT_TOKEN` в `.env`
-
-### Частые ошибки
-
-- `Permission denied (publickey)` при SSH
-  - не добавлен ваш SSH-ключ в VM
-- `fatal: Authentication failed` при `git pull`
-  - нет/просрочен PAT или не настроен deploy key
-- сервис не стартует после обновления
-  - проверьте логи через `journalctl -u <service> -n 200 --no-pager`
-
-
-## Продуктовая аналитика (PostHog)
-
-В боте добавлен `event_logger`, который отправляет продуктовые события в PostHog.
-
-События MVP:
-- `bot_started`
-- `document_uploaded`
-- `link_submitted`
-- `audio_generation_started`
-- `audio_generated`
-- `audio_downloaded`
-- `error_occurred`
-- `subscription_started` (зарезервировано на будущее)
-
-Обязательные принципы:
-- `distinct_id = telegram user_id`
-- не отправляем персональные данные
-- не отправляем текст документов/сообщений
-- события отправляются как отдельные атомарные capture-события
-
-### Быстрая настройка
-
-1. В `.env` добавить:
-
-```env
-POSTHOG_API_KEY=phc_QULeOM973qkka9xUzmJZMhMiq7VBNIF4x167Up2YdQ2
-POSTHOG_PROJECT_ID=326507
-POSTHOG_HOST=https://app.posthog.com
-ANALYTICS_ENABLED=true
-```
-
-2. Перезапустить бота.
-3. Проверить в PostHog, что появляются события.
-
-### Свойства событий
-
-Для всех событий отправляются:
-- `platform=telegram`
-- `source` (если есть)
-- `distinct_id` (как `user_id` Telegram)
-
-Дополнительно:
-- `document_uploaded`: `file_type`, `file_size_kb`
-- `audio_generated`: `duration_sec`, `char_count`, `processing_time_sec`
-- `error_occurred`: `error_type`, `step`
-
-```
-source .venv/bin/activate
-python -m botapp.main
-```
-
-## Development / Checks
-
-Единая команда локальной проверки:
-
-```bash
-make check
-```
-
-Что входит в `make check`:
-- `make lint` — статический анализ (`ruff check`)
-- `make test` — запуск тестов (`pytest`)
-- `make smoke` — минимальный smoke-импорт ключевых модулей без секретов
-
-Полезные команды:
-
-```bash
-make install   # установить runtime + dev зависимости
-make format    # автоисправления ruff + форматирование
-```
-
-Если CI упал:
-1. Открой лог failing job в GitHub Actions.
-2. Локально повтори ту же команду (обычно `make check` или конкретный target).
-3. Исправь причину падения, закоммить и обнови PR.
-

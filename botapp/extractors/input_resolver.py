@@ -4,7 +4,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from botapp.extractors.pdf_text import extract_pdf_text_from_file, extract_pdf_text_from_url
-from botapp.extractors.url_text import extract_url, fetch_article_text
+from botapp.extractors.url_text import extract_url, fetch_article_content
 from botapp.utils.text import normalize_text
 
 
@@ -12,6 +12,9 @@ from botapp.utils.text import normalize_text
 class ResolvedInput:
     source: str
     text: str
+    title: str | None = None
+    body_text: str | None = None
+    source_url: str | None = None
 
 
 async def resolve_input_text(
@@ -33,7 +36,13 @@ async def resolve_input_text(
             text = await extract_pdf_text_from_url(maybe_url, timeout_seconds=timeout_seconds)
             return ResolvedInput(source="pdf_url", text=normalize_text(text))
 
-        text = await fetch_article_text(maybe_url, timeout_seconds=timeout_seconds)
-        return ResolvedInput(source="url", text=normalize_text(text))
+        content = await fetch_article_content(maybe_url, timeout_seconds=timeout_seconds)
+        return ResolvedInput(
+            source="url",
+            text=normalize_text(content.full_text),
+            title=content.title,
+            body_text=normalize_text(content.body_text),
+            source_url=maybe_url,
+        )
 
     return ResolvedInput(source="text", text=cleaned)

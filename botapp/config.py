@@ -7,6 +7,10 @@ from dotenv import load_dotenv
 load_dotenv()
 
 
+def _as_bool(name: str, default: str) -> bool:
+    return os.getenv(name, default).strip().lower() in {"1", "true", "yes", "on"}
+
+
 @dataclass(frozen=True)
 class Settings:
     telegram_bot_token: str
@@ -26,6 +30,16 @@ class Settings:
     posthog_project_id: str = ""
     posthog_host: str = "https://app.posthog.com"
     analytics_enabled: bool = True
+    llm_enabled: bool = True
+    llm_provider: str = "yandex"
+    yandex_api_key: str = ""
+    yandex_folder_id: str = "b1geq9r8nerbilj0i53p"
+    yandex_api_base: str = "https://llm.api.cloud.yandex.net/v1"
+    yandex_model: str = "yandexgpt-lite/latest"
+    llm_timeout_seconds: int = 30
+    llm_max_input_chars: int = 18000
+    llm_debug_send_text_file: bool = True
+    llm_log_prompts: bool = False
 
 
 
@@ -51,5 +65,15 @@ def load_settings() -> Settings:
         posthog_api_key=os.getenv("POSTHOG_API_KEY", "").strip(),
         posthog_project_id=os.getenv("POSTHOG_PROJECT_ID", "").strip(),
         posthog_host=os.getenv("POSTHOG_HOST", "https://app.posthog.com").strip(),
-        analytics_enabled=os.getenv("ANALYTICS_ENABLED", "true").strip().lower() in {"1", "true", "yes", "on"},
+        analytics_enabled=_as_bool("ANALYTICS_ENABLED", "true"),
+        llm_enabled=_as_bool("LLM_ENABLED", "true"),
+        llm_provider=os.getenv("LLM_PROVIDER", "yandex").strip().lower(),
+        yandex_api_key=os.getenv("YANDEX_API_KEY", "").strip(),
+        yandex_folder_id=os.getenv("YANDEX_FOLDER_ID", "b1geq9r8nerbilj0i53p").strip(),
+        yandex_api_base=os.getenv("YANDEX_API_BASE", "https://llm.api.cloud.yandex.net/v1").strip(),
+        yandex_model=os.getenv("YANDEX_MODEL", "yandexgpt-lite/latest").strip(),
+        llm_timeout_seconds=int(os.getenv("LLM_TIMEOUT_SECONDS", "30")),
+        llm_max_input_chars=int(os.getenv("LLM_MAX_INPUT_CHARS", "18000")),
+        llm_debug_send_text_file=_as_bool("LLM_DEBUG_SEND_TEXT_FILE", "true"),
+        llm_log_prompts=_as_bool("LLM_LOG_PROMPTS", "false"),
     )
