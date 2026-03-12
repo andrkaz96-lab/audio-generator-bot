@@ -140,6 +140,7 @@ RUN_LIVE_URL_TESTS=1 PYTHONPATH=. pytest -q tests/test_live_article_urls.py
 
 Важно: это smoke-проверка стабильности пайплайна и она **не должна** фиксировать эвристики только под эти две статьи.
 
+
 ---
 
 ## Отладочный `.txt`

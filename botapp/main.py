@@ -17,6 +17,7 @@ from botapp.analytics import EventLogger
 from botapp.config import load_settings
 from botapp.extractors.article_pipeline import ArticleMode, run_article_pipeline
 from botapp.extractors.input_resolver import resolve_input_text
+from botapp.extractors.article_pipeline import ArticleMode, run_article_pipeline
 from botapp.extractors.url_text import extract_url
 from botapp.llm.service import ArticleLLMService
 from botapp.llm.yandex_client import YandexLLMClient
