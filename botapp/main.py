@@ -9,7 +9,7 @@ from typing import Awaitable, Callable, TypeVar
 
 from aiogram import Bot, Dispatcher, F
 from aiogram.client.session.aiohttp import AiohttpSession
-from aiogram.exceptions import TelegramNetworkError
+from aiogram.exceptions import TelegramBadRequest, TelegramNetworkError
 from aiogram.filters import CommandStart
 from aiogram.types import FSInputFile, KeyboardButton, Message, ReplyKeyboardMarkup, ReplyKeyboardRemove
 
@@ -77,6 +77,66 @@ async def with_telegram_retries(operation: Callable[[], Awaitable[T]], retries: 
             await asyncio.sleep(min(attempt, 3))
     assert last_error is not None
     raise last_error
+
+
+async def safe_update_status(
+    status_message: Message | None,
+    text: str,
+    fallback_message_source: Message,
+) -> Message:
+    chat_id = fallback_message_source.chat.id if fallback_message_source.chat else None
+    status_message_id = status_message.message_id if status_message else None
+    current_text = (status_message.text or "") if status_message else ""
+
+    if status_message is not None and current_text == text:
+        logger.info(
+            "status_update skipped: chat_id=%s status_message_id=%s edit_attempted=false edit_failed=false "
+            "fallback_to_new_message=false exception_text=",
+            chat_id,
+            status_message_id,
+        )
+        return status_message
+
+    if status_message is None:
+        logger.warning(
+            "status_update fallback: chat_id=%s status_message_id=%s edit_attempted=false edit_failed=true "
+            "fallback_to_new_message=true exception_text=status_message is missing",
+            chat_id,
+            status_message_id,
+        )
+        return await with_telegram_retries(
+            lambda: fallback_message_source.answer(text),
+            retries=settings.telegram_api_retries,
+        )
+
+    try:
+        updated_message = await with_telegram_retries(
+            lambda: status_message.edit_text(text),
+            retries=settings.telegram_api_retries,
+        )
+        logger.info(
+            "status_update success: chat_id=%s status_message_id=%s edit_attempted=true edit_failed=false "
+            "fallback_to_new_message=false exception_text=",
+            chat_id,
+            status_message_id,
+        )
+        return updated_message
+    except TelegramBadRequest as exc:
+        exc_text = str(exc)
+        if "message can't be edited" not in exc_text.lower():
+            raise
+
+        logger.warning(
+            "status_update edit failed: chat_id=%s status_message_id=%s edit_attempted=true edit_failed=true "
+            "fallback_to_new_message=true exception_text=%s",
+            chat_id,
+            status_message_id,
+            exc_text,
+        )
+        return await with_telegram_retries(
+            lambda: fallback_message_source.answer(text),
+            retries=settings.telegram_api_retries,
+        )
 
 
 def _distinct_id(message: Message) -> str:
@@ -221,7 +281,7 @@ async def handle_text(message: Message) -> None:
 
 async def _generate_and_send_audio(
     message: Message,
-    status_message: Message,
+    status_message: Message | None,
     raw_text: str | None,
     pdf_path: Path | None,
     url_mode: ArticleMode = MODE_NEAR_VERBATIM,
@@ -260,9 +320,10 @@ async def _generate_and_send_audio(
             resolved_source = resolved.source
 
         if not text:
-            await with_telegram_retries(
-                lambda: status_message.edit_text("Не удалось извлечь текст. Пришли другой источник."),
-                retries=settings.telegram_api_retries,
+            status_message = await safe_update_status(
+                status_message=status_message,
+                text="Не удалось извлечь текст. Пришли другой источник.",
+                fallback_message_source=message,
             )
             await event_logger.capture(
                 event="error_occurred",
@@ -279,9 +340,10 @@ async def _generate_and_send_audio(
 
         chunks = split_text_into_chunks(text, settings.max_chars_per_chunk)
         if not chunks:
-            await with_telegram_retries(
-                lambda: status_message.edit_text("Текст пустой после обработки."),
-                retries=settings.telegram_api_retries,
+            status_message = await safe_update_status(
+                status_message=status_message,
+                text="Текст пустой после обработки.",
+                fallback_message_source=message,
             )
             await event_logger.capture(
                 event="error_occurred",
@@ -292,9 +354,10 @@ async def _generate_and_send_audio(
 
         audio_parts: list[bytes] = []
         for idx, chunk in enumerate(chunks, start=1):
-            await with_telegram_retries(
-                lambda: status_message.edit_text(f"Синтез {idx}/{len(chunks)}..."),
-                retries=settings.telegram_api_retries,
+            status_message = await safe_update_status(
+                status_message=status_message,
+                text=f"Синтез {idx}/{len(chunks)}...",
+                fallback_message_source=message,
             )
             audio_parts.append(await tts_provider.synthesize(chunk))
 
@@ -335,10 +398,11 @@ async def _generate_and_send_audio(
             properties={"source": resolved_source},
         )
 
-        await with_telegram_retries(
-            lambda: status_message.delete(),
-            retries=settings.telegram_api_retries,
-        )
+        if status_message:
+            await with_telegram_retries(
+                lambda: status_message.delete(),
+                retries=settings.telegram_api_retries,
+            )
 
     except Exception as exc:
         logger.exception("Failed to generate audio")
@@ -348,9 +412,10 @@ async def _generate_and_send_audio(
             distinct_id=_distinct_id(message),
             properties={"error_type": type(exc).__name__, "step": "pipeline"},
         )
-        await with_telegram_retries(
-            lambda: status_message.edit_text(error_text),
-            retries=settings.telegram_api_retries,
+        await safe_update_status(
+            status_message=status_message,
+            text=error_text,
+            fallback_message_source=message,
         )
 
 
