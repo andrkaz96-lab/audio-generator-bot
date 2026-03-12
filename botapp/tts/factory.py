@@ -18,6 +18,8 @@ def make_tts_provider(settings: Settings) -> TTSProvider:
             sample_rate=settings.silero_sample_rate,
             model_language=settings.silero_model_language,
             model_speaker=settings.silero_model_speaker,
+            repo_dir=settings.silero_repo_dir,
+            allow_download_on_startup=settings.silero_allow_download_on_startup,
         )
         fallback = GTTSProvider(lang=settings.gtts_lang)
         return FallbackTTSProvider(primary=primary, fallback=fallback)

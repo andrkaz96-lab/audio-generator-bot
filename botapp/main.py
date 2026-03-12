@@ -358,6 +358,11 @@ async def main() -> None:
     if not settings.telegram_bot_token or ":" not in settings.telegram_bot_token:
         raise ValueError("Некорректный TELEGRAM_BOT_TOKEN")
 
+    try:
+        await tts_provider.preload()
+    except Exception as exc:
+        logger.warning("TTS preload error: %s: %s", type(exc).__name__, exc)
+
     session = AiohttpSession(timeout=settings.telegram_api_timeout_seconds)
     bot = Bot(token=settings.telegram_bot_token, session=session)
     await dp.start_polling(bot)
