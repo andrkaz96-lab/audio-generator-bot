@@ -111,9 +111,35 @@
 - `LLM_DEBUG_SEND_TEXT_FILE=true`
 - `LLM_LOG_PROMPTS=false`
 
-Важно: в API передаётся `modelUri` вида:
+Важно: в API передаётся `model` вида:
 
 `gpt://{YANDEX_FOLDER_ID}/yandexgpt-lite`
+
+Важно: для OpenAI-совместимого режима используется endpoint `POST /chat/completions` при base `https://llm.api.cloud.yandex.net/v1`.
+
+---
+
+
+## Локальная проверка pipeline на 2 URL × 2 режима
+
+Для быстрой ручной проверки (без вызова LLM) можно запустить:
+
+```bash
+PYTHONPATH=. python scripts/check_live_urls.py
+```
+
+Или через тест (требует сеть):
+
+```bash
+RUN_LIVE_URL_TESTS=1 PYTHONPATH=. pytest -q tests/test_live_article_urls.py
+```
+
+Проверяются оба режима (`near_verbatim`, `readable_cleaned`) на ссылках:
+- https://incrussia.ru/robots/shadow-ai-v-msb-2026/
+- https://gopractice.ru/stories/do_things_that_dont_scale/
+
+Важно: это smoke-проверка стабильности пайплайна и она **не должна** фиксировать эвристики только под эти две статьи.
+
 
 ---
 

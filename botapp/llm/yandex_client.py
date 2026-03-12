@@ -10,7 +10,7 @@ from botapp.llm.prompts import build_user_prompt, system_prompt_for_mode
 
 
 RETRYABLE_STATUS_CODES = {429, 500, 502, 503, 504}
-NON_RETRYABLE_STATUS_CODES = {400, 401, 403}
+NON_RETRYABLE_STATUS_CODES = {400, 401, 403, 404}
 
 
 @dataclass(frozen=True)
@@ -68,15 +68,13 @@ class YandexLLMClient:
         system_prompt = system_prompt_for_mode(mode)
         user_prompt = build_user_prompt(title=title, body_text=body_text, source_url=source_url, mode=mode)
         payload = {
-            "modelUri": self.model_uri,
-            "completionOptions": {
-                "stream": False,
-                "temperature": self.temperature,
-                "maxTokens": "7000",
-            },
+            "model": self.model_uri,
+            "temperature": self.temperature,
+            "max_tokens": 7000,
             "messages": [
-                {"role": "system", "text": system_prompt},
-                {"role": "user", "text": user_prompt},
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_prompt},
+
             ],
         }
 
@@ -94,7 +92,7 @@ class YandexLLMClient:
             try:
                 async with httpx.AsyncClient(timeout=self.timeout_seconds) as client:
                     response = await client.post(
-                        f"{self.api_base}/completion",
+                        f"{self.api_base}/chat/completions",
                         json=payload,
                         headers=headers,
                     )
@@ -123,11 +121,7 @@ class YandexLLMClient:
 
                 response.raise_for_status()
                 data = response.json()
-                alternatives = data.get("result", {}).get("alternatives", [])
-                output = ""
-                if alternatives:
-                    output = (alternatives[0].get("message") or {}).get("text", "")
-                output = output.strip()
+                output = (((data.get("choices") or [{}])[0].get("message") or {}).get("content") or "").strip()
                 completion_tokens = estimate_tokens(output)
                 return LLMCallResult(
                     output_text=output,

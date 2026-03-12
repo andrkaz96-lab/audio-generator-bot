@@ -9,12 +9,13 @@ from typing import Awaitable, Callable, TypeVar
 
 from aiogram import Bot, Dispatcher, F
 from aiogram.client.session.aiohttp import AiohttpSession
-from aiogram.exceptions import TelegramNetworkError
+from aiogram.exceptions import TelegramBadRequest, TelegramNetworkError
 from aiogram.filters import CommandStart
 from aiogram.types import FSInputFile, KeyboardButton, Message, ReplyKeyboardMarkup, ReplyKeyboardRemove
 
 from botapp.analytics import EventLogger
 from botapp.config import load_settings
+from botapp.extractors.article_pipeline import ArticleMode, run_article_pipeline
 from botapp.extractors.input_resolver import resolve_input_text
 from botapp.extractors.article_pipeline import ArticleMode, run_article_pipeline
 from botapp.extractors.url_text import extract_url
@@ -77,6 +78,34 @@ async def with_telegram_retries(operation: Callable[[], Awaitable[T]], retries: 
             await asyncio.sleep(min(attempt, 3))
     assert last_error is not None
     raise last_error
+
+
+async def _safe_status_edit(message: Message, status_message: Message, text: str) -> Message:
+    try:
+        await with_telegram_retries(
+            lambda: status_message.edit_text(text),
+            retries=settings.telegram_api_retries,
+        )
+        return status_message
+    except TelegramBadRequest as exc:
+        error = str(exc).lower()
+        if "message is not modified" in error:
+            return status_message
+        logger.warning("Status message is not editable anymore, posting a new one", extra={"error": str(exc)})
+        return await with_telegram_retries(
+            lambda: message.answer(text),
+            retries=settings.telegram_api_retries,
+        )
+
+
+async def _safe_status_delete(status_message: Message) -> None:
+    try:
+        await with_telegram_retries(
+            lambda: status_message.delete(),
+            retries=settings.telegram_api_retries,
+        )
+    except TelegramBadRequest:
+        logger.info("Status message already deleted or cannot be deleted")
 
 
 def _distinct_id(message: Message) -> str:
@@ -227,6 +256,7 @@ async def _generate_and_send_audio(
     url_mode: ArticleMode = MODE_NEAR_VERBATIM,
 ) -> None:
     started_at = time.perf_counter()
+    status_ref = status_message
     try:
         maybe_url = extract_url(raw_text or "")
         if maybe_url and pdf_path is None:
@@ -260,10 +290,7 @@ async def _generate_and_send_audio(
             resolved_source = resolved.source
 
         if not text:
-            await with_telegram_retries(
-                lambda: status_message.edit_text("Не удалось извлечь текст. Пришли другой источник."),
-                retries=settings.telegram_api_retries,
-            )
+            status_ref = await _safe_status_edit(message, status_ref, "Не удалось извлечь текст. Пришли другой источник.")
             await event_logger.capture(
                 event="error_occurred",
                 distinct_id=_distinct_id(message),
@@ -279,10 +306,7 @@ async def _generate_and_send_audio(
 
         chunks = split_text_into_chunks(text, settings.max_chars_per_chunk)
         if not chunks:
-            await with_telegram_retries(
-                lambda: status_message.edit_text("Текст пустой после обработки."),
-                retries=settings.telegram_api_retries,
-            )
+            status_ref = await _safe_status_edit(message, status_ref, "Текст пустой после обработки.")
             await event_logger.capture(
                 event="error_occurred",
                 distinct_id=_distinct_id(message),
@@ -292,10 +316,7 @@ async def _generate_and_send_audio(
 
         audio_parts: list[bytes] = []
         for idx, chunk in enumerate(chunks, start=1):
-            await with_telegram_retries(
-                lambda: status_message.edit_text(f"Синтез {idx}/{len(chunks)}..."),
-                retries=settings.telegram_api_retries,
-            )
+            status_ref = await _safe_status_edit(message, status_ref, f"Синтез {idx}/{len(chunks)}...")
             audio_parts.append(await tts_provider.synthesize(chunk))
 
         output = b"".join(audio_parts)
@@ -335,10 +356,7 @@ async def _generate_and_send_audio(
             properties={"source": resolved_source},
         )
 
-        await with_telegram_retries(
-            lambda: status_message.delete(),
-            retries=settings.telegram_api_retries,
-        )
+        await _safe_status_delete(status_ref)
 
     except Exception as exc:
         logger.exception("Failed to generate audio")
@@ -348,10 +366,10 @@ async def _generate_and_send_audio(
             distinct_id=_distinct_id(message),
             properties={"error_type": type(exc).__name__, "step": "pipeline"},
         )
-        await with_telegram_retries(
-            lambda: status_message.edit_text(error_text),
-            retries=settings.telegram_api_retries,
-        )
+        try:
+            await _safe_status_edit(message, status_ref, error_text)
+        except Exception:
+            logger.exception("Failed to report pipeline error to user")
 
 
 async def main() -> None:
