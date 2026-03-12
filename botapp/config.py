@@ -1,5 +1,6 @@
 from dataclasses import dataclass
 import os
+from pathlib import Path
 
 from dotenv import load_dotenv
 
@@ -21,6 +22,8 @@ class Settings:
     silero_sample_rate: int = 48000
     silero_model_language: str = "ru"
     silero_model_speaker: str = "v4_ru"
+    silero_repo_dir: str = str(Path.home() / ".cache" / "audio-generator-bot" / "silero-models")
+    silero_allow_download_on_startup: bool = True
     max_chars_per_chunk: int = 4000
     max_input_chars: int = 60000
     request_timeout_seconds: int = 20
@@ -57,6 +60,8 @@ def load_settings() -> Settings:
         silero_sample_rate=int(os.getenv("SILERO_SAMPLE_RATE", "48000")),
         silero_model_language=os.getenv("SILERO_MODEL_LANGUAGE", "ru").strip(),
         silero_model_speaker=os.getenv("SILERO_MODEL_SPEAKER", "v4_ru").strip(),
+        silero_repo_dir=os.getenv("SILERO_REPO_DIR", str(Path.home() / ".cache" / "audio-generator-bot" / "silero-models")).strip(),
+        silero_allow_download_on_startup=_as_bool("SILERO_ALLOW_DOWNLOAD_ON_STARTUP", "true"),
         max_chars_per_chunk=int(os.getenv("MAX_CHARS_PER_CHUNK", "4000")),
         max_input_chars=int(os.getenv("MAX_INPUT_CHARS", "60000")),
         request_timeout_seconds=int(os.getenv("REQUEST_TIMEOUT_SECONDS", "20")),

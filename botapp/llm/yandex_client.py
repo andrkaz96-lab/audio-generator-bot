@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 import time
 from dataclasses import dataclass
 
@@ -35,6 +36,9 @@ def estimate_tokens(text: str) -> int:
     return max(1, len(text) // 4)
 
 
+logger = logging.getLogger(__name__)
+
+
 class YandexLLMClient:
     def __init__(
         self,
@@ -67,17 +71,15 @@ class YandexLLMClient:
     ) -> LLMCallResult:
         system_prompt = system_prompt_for_mode(mode)
         user_prompt = build_user_prompt(title=title, body_text=body_text, source_url=source_url, mode=mode)
+        endpoint = "/chat/completions"
         payload = {
-            "modelUri": self.model_uri,
-            "completionOptions": {
-                "stream": False,
-                "temperature": self.temperature,
-                "maxTokens": "7000",
-            },
+            "model": self.model_uri,
+            "temperature": self.temperature,
             "messages": [
-                {"role": "system", "text": system_prompt},
-                {"role": "user", "text": user_prompt},
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_prompt},
             ],
+            "max_tokens": 7000,
         }
 
         headers = {
@@ -94,12 +96,37 @@ class YandexLLMClient:
             try:
                 async with httpx.AsyncClient(timeout=self.timeout_seconds) as client:
                     response = await client.post(
-                        f"{self.api_base}/completion",
+                        f"{self.api_base}{endpoint}",
                         json=payload,
                         headers=headers,
                     )
+                logger.info(
+                    "LLM request completed",
+                    extra={
+                        "provider": "yandex",
+                        "base_url": self.api_base,
+                        "endpoint": endpoint,
+                        "model_uri": self.model_uri,
+                        "status_code": response.status_code,
+                        "success": response.status_code < 400,
+                        "latency_ms": int((time.perf_counter() - request_started) * 1000),
+                    },
+                )
 
                 if response.status_code in NON_RETRYABLE_STATUS_CODES:
+                    logger.error(
+                        "LLM request failed with non-retryable status",
+                        extra={
+                            "provider": "yandex",
+                            "base_url": self.api_base,
+                            "endpoint": endpoint,
+                            "model_uri": self.model_uri,
+                            "success": False,
+                            "status_code": response.status_code,
+                            "error_body": getattr(response, "text", "")[:500],
+                            "latency_ms": int((time.perf_counter() - request_started) * 1000),
+                        },
+                    )
                     return self._error_result(
                         error_type=f"HTTP_{response.status_code}",
                         latency_ms=int((time.perf_counter() - request_started) * 1000),
@@ -113,6 +140,19 @@ class YandexLLMClient:
                     if attempt < self.max_retries:
                         await asyncio.sleep(2**attempt)
                         continue
+                    logger.error(
+                        "LLM request failed after retries",
+                        extra={
+                            "provider": "yandex",
+                            "base_url": self.api_base,
+                            "endpoint": endpoint,
+                            "model_uri": self.model_uri,
+                            "success": False,
+                            "status_code": response.status_code,
+                            "error_body": getattr(response, "text", "")[:500],
+                            "latency_ms": int((time.perf_counter() - request_started) * 1000),
+                        },
+                    )
                     return self._error_result(
                         error_type=last_error,
                         latency_ms=int((time.perf_counter() - request_started) * 1000),
@@ -123,10 +163,11 @@ class YandexLLMClient:
 
                 response.raise_for_status()
                 data = response.json()
-                alternatives = data.get("result", {}).get("alternatives", [])
+                choices = data.get("choices", [])
                 output = ""
-                if alternatives:
-                    output = (alternatives[0].get("message") or {}).get("text", "")
+                if choices:
+                    message = choices[0].get("message") or {}
+                    output = message.get("content", "")
                 output = output.strip()
                 completion_tokens = estimate_tokens(output)
                 return LLMCallResult(
@@ -146,11 +187,37 @@ class YandexLLMClient:
                 )
             except (httpx.TimeoutException, httpx.ConnectError) as exc:
                 last_error = type(exc).__name__
+                logger.error(
+                    "LLM transport error",
+                    extra={
+                        "provider": "yandex",
+                        "base_url": self.api_base,
+                        "endpoint": endpoint,
+                        "model_uri": self.model_uri,
+                        "success": False,
+                        "status_code": None,
+                        "error_body": str(exc),
+                        "latency_ms": int((time.perf_counter() - request_started) * 1000),
+                    },
+                )
                 if attempt < self.max_retries:
                     await asyncio.sleep(2**attempt)
                     continue
             except Exception as exc:
                 last_error = type(exc).__name__
+                logger.exception(
+                    "LLM unexpected error",
+                    extra={
+                        "provider": "yandex",
+                        "base_url": self.api_base,
+                        "endpoint": endpoint,
+                        "model_uri": self.model_uri,
+                        "success": False,
+                        "status_code": None,
+                        "error_body": str(exc),
+                        "latency_ms": int((time.perf_counter() - request_started) * 1000),
+                    },
+                )
                 break
 
         return self._error_result(

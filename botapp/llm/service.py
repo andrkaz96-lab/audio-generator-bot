@@ -105,6 +105,10 @@ class ArticleLLMService:
             retries += chunk_result.retry_count
             if not chunk_result.success:
                 last_error = chunk_result.error_type
+                logger.warning(
+                    "LLM normalization failed, using deterministic fallback text",
+                    extra={"provider": self.provider, "error_type": last_error, "source_url": source_url},
+                )
                 return self._fallback_result(
                     fallback_text=fallback_text,
                     input_chars=input_chars,

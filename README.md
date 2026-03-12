@@ -105,13 +105,16 @@
 - `YANDEX_API_KEY=`
 - `YANDEX_FOLDER_ID=`
 - `YANDEX_API_BASE=https://llm.api.cloud.yandex.net/v1`
-- `YANDEX_MODEL=yandexgpt-lite/latest` (конфиг-метка)
 - `LLM_TIMEOUT_SECONDS=30`
 - `LLM_MAX_INPUT_CHARS=18000`
 - `LLM_DEBUG_SEND_TEXT_FILE=true`
 - `LLM_LOG_PROMPTS=false`
 
-Важно: в API передаётся `modelUri` вида:
+Важно: для OpenAI-compatible YandexGPT используется endpoint:
+
+`POST https://llm.api.cloud.yandex.net/v1/chat/completions`
+
+В API передаётся `model` вида:
 
 `gpt://{YANDEX_FOLDER_ID}/yandexgpt-lite`
 
@@ -139,3 +142,28 @@ source .venv/bin/activate
 pip install -r requirements.txt
 python -m botapp.main
 ```
+
+
+## Надёжность TTS (Silero + fallback)
+
+- Silero предзагружается на старте приложения (`tts_provider.preload()`), а не в момент пользовательского запроса.
+- По умолчанию репозиторий модели хранится в `~/.cache/audio-generator-bot/silero-models` (можно переопределить `SILERO_REPO_DIR`).
+- Если репозиторий отсутствует, он может быть скачан **один раз на старте** (`SILERO_ALLOW_DOWNLOAD_ON_STARTUP=true`).
+- Во время обработки сообщений используется только уже загруженная модель; runtime-загрузка через `torch.hub` из сети не требуется.
+- Если primary TTS падает, включается fallback-провайдер. Если fallback тоже недоступен — бот отправит понятную ошибку в чат.
+
+### Полезные логи
+
+LLM:
+- `provider`, `base_url`, `endpoint`, `model_uri`, `status_code`, `success`, `latency_ms`, `error_body`.
+
+TTS:
+- `provider_name`, `fallback_provider_name`, `model_source`, `preload_success`, `error_type`, `error_message`.
+
+### Быстрая проверка
+
+1. Запустите бота и убедитесь, что в логах есть вызов:
+   `https://llm.api.cloud.yandex.net/v1/chat/completions`
+2. Убедитесь, что нет вызовов:
+   `.../v1/completion`
+3. Проверьте, что Silero preload происходит на старте, а не на первом пользовательском сообщении.
