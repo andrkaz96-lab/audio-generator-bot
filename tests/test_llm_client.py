@@ -40,7 +40,7 @@ class YandexClientRetryTests(unittest.IsolatedAsyncioTestCase):
     async def test_retries_on_429(self):
         responses = [
             FakeResponse(status_code=429),
-            FakeResponse(status_code=200, payload={"result": {"alternatives": [{"message": {"text": "A"}}]}}),
+            FakeResponse(status_code=200, payload={"choices": [{"message": {"content": "A"}}]}),
         ]
         with patch("httpx.AsyncClient", side_effect=lambda *a, **k: FakeAsyncClient(responses)):
             client = YandexLLMClient(api_key="k", folder_id="f")
