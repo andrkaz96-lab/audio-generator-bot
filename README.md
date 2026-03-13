@@ -4,10 +4,11 @@
 
 ## Что добавлено
 
-Для URL-статей реализован гибридный пайплайн с двумя режимами:
+Для URL-статей реализован гибридный пайплайн с тремя режимами:
 
-- `near_verbatim` — максимально близко к оригиналу, только очистка от мусора.
-- `readable_cleaned` — мягкая адаптация для восприятия и озвучки без изменения фактов.
+- `close_to_source` (`near_verbatim` alias) — максимально близко к оригиналу, rule-based очистка + fallback LLM только при плохом extraction quality.
+- `audio_adapted` (`readable_cleaned` alias) — полноценная адаптация под слух с обязательным LLM и verification/repair.
+- `audio_summary` — краткая версия под слух с обязательным LLM и hard cap 3 минуты.
 
 Ключевой принцип: **extractor-first, LLM only when needed**.
 
@@ -19,8 +20,9 @@
 
 Если пользователь отправляет ссылку, бот предлагает кнопки:
 
-- `🧾 Почти дословно` (`near_verbatim`)
-- `🎧 Чистый для озвучки` (`readable_cleaned`)
+- `🧾 Близко к оригиналу` (`close_to_source`)
+- `🎧 Под слух` (`audio_adapted`)
+- `⚡ Коротко под слух` (`audio_summary`)
 
 После выбора запускается обработка URL в выбранном режиме.
 
@@ -31,8 +33,9 @@
 1. `fetch page`
 2. `rule-based extraction`
 3. `quality evaluation`
-4. `LLM fallback only if needed` (Yandex)
-5. `separate TTS normalization`
+4. `mode-specific transform` (rule-based или LLM)
+5. `verification/repair` для аудио-режимов
+6. `shared TTS normalization + duration control`
 
 ### 3) Решения по режимам
 
