@@ -332,6 +332,23 @@ async def _generate_and_send_audio(
             )
             return
 
+        if resolved_source == "url":
+            status_message = await safe_update_status(
+                status_message=status_message,
+                text="Отправляю текст статьи перед синтезом...",
+                fallback_message_source=message,
+            )
+            with tempfile.TemporaryDirectory() as tmpdir:
+                article_text_path = Path(tmpdir) / "article_tts_input.txt"
+                article_text_path.write_text(text, encoding="utf-8")
+                await with_telegram_retries(
+                    lambda: message.answer_document(
+                        document=FSInputFile(article_text_path),
+                        caption="Текст, который отправляю в синтез.",
+                    ),
+                    retries=settings.telegram_api_retries,
+                )
+
         await event_logger.capture(
             event="audio_generation_started",
             distinct_id=_distinct_id(message),
