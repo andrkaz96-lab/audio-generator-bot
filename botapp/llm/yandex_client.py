@@ -7,7 +7,13 @@ from dataclasses import dataclass
 
 import httpx
 
-from botapp.llm.prompts import PromptContext, build_user_prompt, system_prompt_for_mode
+from botapp.llm.prompts import (
+    MODE_AUDIO_ADAPTED,
+    MODE_AUDIO_SUMMARY,
+    PromptContext,
+    build_user_prompt,
+    system_prompt_for_mode,
+)
 
 
 RETRYABLE_STATUS_CODES = {429, 500, 502, 503, 504}
@@ -68,17 +74,32 @@ class YandexLLMClient:
         body_text: str,
         source_url: str | None,
         mode: str = "near_verbatim",
+        target_duration_sec: int | None = None,
+        hard_cap_sec: int | None = None,
+        word_budget: int | None = None,
     ) -> LLMCallResult:
         system_prompt = system_prompt_for_mode(mode)
         user_prompt = build_user_prompt(
             context=PromptContext(
-                mode=mode, title=title, body_text=body_text, source_url=source_url
+                mode=mode,
+                title=title,
+                body_text=body_text,
+                source_url=source_url,
+                target_duration_sec=target_duration_sec,
+                hard_cap_sec=hard_cap_sec,
+                word_budget=word_budget,
             )
         )
+        max_tokens = 7000
+        if mode == MODE_AUDIO_ADAPTED:
+            max_tokens = 8500
+        elif mode == MODE_AUDIO_SUMMARY:
+            max_tokens = 4500
         return await self.complete(
             system_prompt=system_prompt,
             user_prompt=user_prompt,
             input_chars=len(body_text) + len(title or ""),
+            max_tokens=max_tokens,
         )
 
     async def complete(
