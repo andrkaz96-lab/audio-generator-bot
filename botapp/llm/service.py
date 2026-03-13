@@ -1,17 +1,28 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import logging
 import re
 from dataclasses import dataclass
 from urllib.parse import urlparse
 
-from botapp.llm.yandex_client import LLMCallResult, YandexLLMClient, estimate_tokens
+from botapp.llm.prompts import (
+    MODE_AUDIO_ADAPTED,
+    MODE_AUDIO_SUMMARY,
+    MODE_CLOSE_TO_SOURCE,
+    SYSTEM_PROMPT_VERIFIER,
+    build_verifier_prompt,
+    canonical_mode,
+)
+from botapp.llm.yandex_client import YandexLLMClient, estimate_tokens
 
 
 logger = logging.getLogger(__name__)
 
-_GARBAGE_LINE_RE = re.compile(r"(cookie|подпис|subscribe|share|навигац|все права защищены)", re.IGNORECASE)
+_GARBAGE_LINE_RE = re.compile(
+    r"(cookie|подпис|subscribe|share|навигац|все права защищены)", re.IGNORECASE
+)
 
 
 @dataclass(frozen=True)
@@ -38,6 +49,13 @@ class ArticleTTSResult:
     estimation_method: str
 
 
+@dataclass(frozen=True)
+class VerificationResult:
+    status: str
+    repaired_text: str
+    notes: str
+
+
 class ArticleLLMService:
     def __init__(
         self,
@@ -61,18 +79,19 @@ class ArticleLLMService:
         title: str | None,
         body_text: str,
         source_url: str | None = None,
-        mode: str = "near_verbatim",
+        mode: str = MODE_CLOSE_TO_SOURCE,
     ) -> ArticleTTSResult:
+        mode = canonical_mode(mode)
         body = self._cleanup_body(body_text)
         fallback_text = self._assemble_text(title, body)
         paragraphs = [p for p in body.split("\n\n") if p.strip()]
         input_chars = len(fallback_text)
         input_paragraphs = len(paragraphs)
 
-        chunks, was_truncated = self._chunk_paragraphs(title=title, paragraphs=paragraphs)
+        chunks, was_truncated = self._chunk_paragraphs(
+            title=title, paragraphs=paragraphs
+        )
         was_chunked = len(chunks) > 1
-        if was_chunked:
-            logger.info("LLM chunking enabled", extra={"chunk_count": len(chunks), "source_url": source_url})
 
         if not self.enabled or self.provider != "yandex" or self.client is None:
             return self._fallback_result(
@@ -85,30 +104,18 @@ class ArticleLLMService:
             )
 
         normalized_chunks: list[str] = []
-        prompt_tokens = 0
-        completion_tokens = 0
-        latency_ms = 0
-        retries = 0
-        last_error: str | None = None
+        prompt_tokens = completion_tokens = latency_ms = retries = 0
 
         for index, chunk in enumerate(chunks):
             chunk_title = title if index == 0 else None
             chunk_result = await self.client.normalize_article(
-                title=chunk_title,
-                body_text=chunk,
-                source_url=source_url,
-                mode=mode,
+                title=chunk_title, body_text=chunk, source_url=source_url, mode=mode
             )
             prompt_tokens += chunk_result.estimated_prompt_tokens
             completion_tokens += chunk_result.estimated_completion_tokens
             latency_ms += chunk_result.latency_ms
             retries += chunk_result.retry_count
             if not chunk_result.success:
-                last_error = chunk_result.error_type
-                logger.warning(
-                    "LLM normalization failed, using deterministic fallback text",
-                    extra={"provider": self.provider, "error_type": last_error, "source_url": source_url},
-                )
                 return self._fallback_result(
                     fallback_text=fallback_text,
                     input_chars=input_chars,
@@ -116,7 +123,7 @@ class ArticleLLMService:
                     was_chunked=was_chunked,
                     chunk_count=len(chunks),
                     was_truncated=was_truncated,
-                    error_type=last_error,
+                    error_type=chunk_result.error_type,
                     retry_count=retries,
                     latency_ms=latency_ms,
                     prompt_tokens=prompt_tokens,
@@ -148,6 +155,67 @@ class ArticleLLMService:
             estimation_method="local_heuristic",
         )
 
+    async def verify_and_repair(
+        self, *, source_title: str | None, source_body: str, draft_text: str, mode: str
+    ) -> VerificationResult:
+        mode = canonical_mode(mode)
+        if mode not in {MODE_AUDIO_ADAPTED, MODE_AUDIO_SUMMARY}:
+            return VerificationResult(
+                status="pass", repaired_text=draft_text, notes="skipped"
+            )
+
+        deterministic = self._deterministic_verify(
+            source_body=source_body, draft_text=draft_text
+        )
+        if deterministic == "pass" and (
+            not self.enabled or self.provider != "yandex" or self.client is None
+        ):
+            return VerificationResult(
+                status="pass", repaired_text=draft_text, notes="deterministic"
+            )
+        if not self.enabled or self.provider != "yandex" or self.client is None:
+            return VerificationResult(
+                status="failed",
+                repaired_text=self._assemble_text(source_title, source_body),
+                notes="llm_unavailable",
+            )
+
+        verifier_user = build_verifier_prompt(
+            source_title=source_title, source_body=source_body, draft_text=draft_text
+        )
+        raw = await self.client.complete(
+            system_prompt=SYSTEM_PROMPT_VERIFIER,
+            user_prompt=verifier_user,
+            input_chars=len(source_body) + len(draft_text),
+            max_tokens=2500,
+        )
+        if not raw.success or not raw.output_text.strip():
+            return VerificationResult(
+                status="failed",
+                repaired_text=self._assemble_text(source_title, source_body),
+                notes="verifier_error",
+            )
+
+        parsed = self._parse_verifier_output(raw.output_text)
+        if parsed["decision"] == "pass":
+            return VerificationResult(
+                status="pass", repaired_text=draft_text, notes=parsed["notes"]
+            )
+        if parsed["decision"] == "repair" and parsed["repaired_text"].strip():
+            repaired = parsed["repaired_text"].strip()
+            if (
+                self._deterministic_verify(source_body=source_body, draft_text=repaired)
+                == "pass"
+            ):
+                return VerificationResult(
+                    status="repaired", repaired_text=repaired, notes=parsed["notes"]
+                )
+        return VerificationResult(
+            status="failed",
+            repaired_text=self._assemble_text(source_title, source_body),
+            notes=parsed["notes"],
+        )
+
     def analytics_properties(
         self,
         *,
@@ -164,7 +232,11 @@ class ArticleLLMService:
             "flow": "article_to_tts",
             "source_type": "url",
             "source_domain": urlparse(source_url).netloc if source_url else "",
-            "source_url_hash": hashlib.sha256((source_url or "").encode("utf-8")).hexdigest() if source_url else "",
+            "source_url_hash": hashlib.sha256(
+                (source_url or "").encode("utf-8")
+            ).hexdigest()
+            if source_url
+            else "",
             "article_has_title": bool((title or "").strip()),
             "input_chars": result.input_chars,
             "output_chars": result.output_chars,
@@ -195,30 +267,42 @@ class ArticleLLMService:
         safe_title = (title or "").strip() or "Без названия"
         return f"{safe_title}\n\n{body.strip()}".strip()
 
-    def _chunk_paragraphs(self, *, title: str | None, paragraphs: list[str]) -> tuple[list[str], bool]:
+    def _deterministic_verify(self, *, source_body: str, draft_text: str) -> str:
+        draft_numbers = set(re.findall(r"\b\d+[\d.,%]*\b", draft_text))
+        source_numbers = set(re.findall(r"\b\d+[\d.,%]*\b", source_body))
+        if draft_numbers - source_numbers:
+            return "repair"
+        return "pass"
+
+    def _parse_verifier_output(self, text: str) -> dict[str, str]:
+        try:
+            payload = json.loads(text)
+            return {
+                "decision": payload.get("decision", "fail"),
+                "notes": payload.get("notes", ""),
+                "repaired_text": payload.get("repaired_text", ""),
+            }
+        except Exception:
+            return {"decision": "fail", "notes": "bad_json", "repaired_text": ""}
+
+    def _chunk_paragraphs(
+        self, *, title: str | None, paragraphs: list[str]
+    ) -> tuple[list[str], bool]:
         if not paragraphs:
             return [""], False
-
         chunks: list[str] = []
         current = ""
-        first_limit = self.max_input_chars
         for idx, paragraph in enumerate(paragraphs):
             prefix = f"{(title or '').strip()}\n\n" if idx == 0 and title else ""
             candidate = (current + "\n\n" + paragraph).strip() if current else paragraph
-            limit = first_limit if not chunks else self.max_input_chars
-            if len(prefix + candidate) <= limit:
+            if len(prefix + candidate) <= self.max_input_chars:
                 current = candidate
                 continue
-
             if current:
                 chunks.append(current)
                 current = paragraph
                 continue
-
-            # Single paragraph exceeds limit: truncate at paragraph boundary (drop paragraph).
-            logger.warning("Paragraph exceeds hard LLM limit and will be truncated")
             return chunks or [""], True
-
         if current:
             chunks.append(current)
         return chunks, False
@@ -231,7 +315,9 @@ class ArticleLLMService:
         if len(lines) >= 2 and lines[1].strip() == "":
             normalized_title = lines[0].strip()
             first_body = "\n".join(lines[2:]).strip()
-            all_body = "\n\n".join([first_body] + [c.strip() for c in chunks[1:] if c.strip()]).strip()
+            all_body = "\n\n".join(
+                [first_body] + [c.strip() for c in chunks[1:] if c.strip()]
+            ).strip()
             return self._assemble_text(normalized_title, all_body)
         return self._assemble_text(title, "\n\n".join(chunks))
 
@@ -250,7 +336,11 @@ class ArticleLLMService:
         prompt_tokens: int | None = None,
         completion_tokens: int = 0,
     ) -> ArticleTTSResult:
-        prompt = prompt_tokens if prompt_tokens is not None else estimate_tokens(fallback_text)
+        prompt = (
+            prompt_tokens
+            if prompt_tokens is not None
+            else estimate_tokens(fallback_text)
+        )
         return ArticleTTSResult(
             final_text=fallback_text,
             used_fallback=True,
@@ -262,7 +352,9 @@ class ArticleLLMService:
             input_chars=input_chars,
             output_chars=len(fallback_text),
             input_paragraphs=input_paragraphs,
-            output_paragraphs=len([p for p in fallback_text.split("\n\n") if p.strip()]),
+            output_paragraphs=len(
+                [p for p in fallback_text.split("\n\n") if p.strip()]
+            ),
             was_chunked=was_chunked,
             chunk_count=chunk_count,
             was_truncated=was_truncated,

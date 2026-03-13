@@ -7,7 +7,7 @@ from dataclasses import dataclass
 
 import httpx
 
-from botapp.llm.prompts import build_user_prompt, system_prompt_for_mode
+from botapp.llm.prompts import PromptContext, build_user_prompt, system_prompt_for_mode
 
 
 RETRYABLE_STATUS_CODES = {429, 500, 502, 503, 504}
@@ -70,7 +70,25 @@ class YandexLLMClient:
         mode: str = "near_verbatim",
     ) -> LLMCallResult:
         system_prompt = system_prompt_for_mode(mode)
-        user_prompt = build_user_prompt(title=title, body_text=body_text, source_url=source_url, mode=mode)
+        user_prompt = build_user_prompt(
+            context=PromptContext(
+                mode=mode, title=title, body_text=body_text, source_url=source_url
+            )
+        )
+        return await self.complete(
+            system_prompt=system_prompt,
+            user_prompt=user_prompt,
+            input_chars=len(body_text) + len(title or ""),
+        )
+
+    async def complete(
+        self,
+        *,
+        system_prompt: str,
+        user_prompt: str,
+        input_chars: int,
+        max_tokens: int = 7000,
+    ) -> LLMCallResult:
         endpoint = "/chat/completions"
         payload = {
             "model": self.model_uri,
@@ -79,7 +97,7 @@ class YandexLLMClient:
                 {"role": "system", "content": system_prompt},
                 {"role": "user", "content": user_prompt},
             ],
-            "max_tokens": 7000,
+            "max_tokens": max_tokens,
         }
 
         headers = {
@@ -109,7 +127,9 @@ class YandexLLMClient:
                         "model_uri": self.model_uri,
                         "status_code": response.status_code,
                         "success": response.status_code < 400,
-                        "latency_ms": int((time.perf_counter() - request_started) * 1000),
+                        "latency_ms": int(
+                            (time.perf_counter() - request_started) * 1000
+                        ),
                     },
                 )
 
@@ -124,13 +144,15 @@ class YandexLLMClient:
                             "success": False,
                             "status_code": response.status_code,
                             "error_body": getattr(response, "text", "")[:500],
-                            "latency_ms": int((time.perf_counter() - request_started) * 1000),
+                            "latency_ms": int(
+                                (time.perf_counter() - request_started) * 1000
+                            ),
                         },
                     )
                     return self._error_result(
                         error_type=f"HTTP_{response.status_code}",
                         latency_ms=int((time.perf_counter() - request_started) * 1000),
-                        input_chars=len(body_text) + len(title or ""),
+                        input_chars=input_chars,
                         prompt_tokens=prompt_tokens,
                         retry_count=attempt,
                     )
@@ -150,13 +172,15 @@ class YandexLLMClient:
                             "success": False,
                             "status_code": response.status_code,
                             "error_body": getattr(response, "text", "")[:500],
-                            "latency_ms": int((time.perf_counter() - request_started) * 1000),
+                            "latency_ms": int(
+                                (time.perf_counter() - request_started) * 1000
+                            ),
                         },
                     )
                     return self._error_result(
                         error_type=last_error,
                         latency_ms=int((time.perf_counter() - request_started) * 1000),
-                        input_chars=len(body_text) + len(title or ""),
+                        input_chars=input_chars,
                         prompt_tokens=prompt_tokens,
                         retry_count=attempt,
                     )
@@ -177,7 +201,7 @@ class YandexLLMClient:
                     success=bool(output),
                     error_type=None if output else "EmptyOutput",
                     latency_ms=int((time.perf_counter() - request_started) * 1000),
-                    input_chars=len(body_text) + len(title or ""),
+                    input_chars=input_chars,
                     output_chars=len(output),
                     estimated_prompt_tokens=prompt_tokens,
                     estimated_completion_tokens=completion_tokens,
@@ -197,7 +221,9 @@ class YandexLLMClient:
                         "success": False,
                         "status_code": None,
                         "error_body": str(exc),
-                        "latency_ms": int((time.perf_counter() - request_started) * 1000),
+                        "latency_ms": int(
+                            (time.perf_counter() - request_started) * 1000
+                        ),
                     },
                 )
                 if attempt < self.max_retries:
@@ -215,7 +241,9 @@ class YandexLLMClient:
                         "success": False,
                         "status_code": None,
                         "error_body": str(exc),
-                        "latency_ms": int((time.perf_counter() - request_started) * 1000),
+                        "latency_ms": int(
+                            (time.perf_counter() - request_started) * 1000
+                        ),
                     },
                 )
                 break
@@ -223,7 +251,7 @@ class YandexLLMClient:
         return self._error_result(
             error_type=last_error or "UnknownError",
             latency_ms=int((time.perf_counter() - request_started) * 1000),
-            input_chars=len(body_text) + len(title or ""),
+            input_chars=input_chars,
             prompt_tokens=prompt_tokens,
             retry_count=self.max_retries,
         )

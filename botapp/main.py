@@ -11,7 +11,13 @@ from aiogram import Bot, Dispatcher, F
 from aiogram.client.session.aiohttp import AiohttpSession
 from aiogram.exceptions import TelegramBadRequest, TelegramNetworkError
 from aiogram.filters import CommandStart
-from aiogram.types import FSInputFile, KeyboardButton, Message, ReplyKeyboardMarkup, ReplyKeyboardRemove
+from aiogram.types import (
+    FSInputFile,
+    KeyboardButton,
+    Message,
+    ReplyKeyboardMarkup,
+    ReplyKeyboardRemove,
+)
 
 from botapp.analytics import EventLogger
 from botapp.config import load_settings
@@ -56,16 +62,22 @@ llm_service = ArticleLLMService(
 
 dp = Dispatcher()
 T = TypeVar("T")
-MODE_NEAR_VERBATIM = "near_verbatim"
-MODE_READABLE_CLEANED = "readable_cleaned"
+MODE_CLOSE_TO_SOURCE = "close_to_source"
+MODE_AUDIO_ADAPTED = "audio_adapted"
+MODE_AUDIO_SUMMARY = "audio_summary"
 MODE_BUTTON_TO_VALUE: dict[str, ArticleMode] = {
-    "🧾 Почти дословно": MODE_NEAR_VERBATIM,
-    "🎧 Чистый для озвучки": MODE_READABLE_CLEANED,
+    "🧾 Близко к оригиналу": MODE_CLOSE_TO_SOURCE,
+    "🎧 Под слух": MODE_AUDIO_ADAPTED,
+    "⚡ Коротко под слух": MODE_AUDIO_SUMMARY,
+    "🧾 Почти дословно": MODE_CLOSE_TO_SOURCE,
+    "🎧 Чистый для озвучки": MODE_AUDIO_ADAPTED,
 }
 _pending_url_by_user: dict[int, str] = {}
 
 
-async def with_telegram_retries(operation: Callable[[], Awaitable[T]], retries: int) -> T:
+async def with_telegram_retries(
+    operation: Callable[[], Awaitable[T]], retries: int
+) -> T:
     last_error: Exception | None = None
     for attempt in range(1, retries + 1):
         try:
@@ -192,7 +204,10 @@ async def handle_document(message: Message, bot: Bot) -> None:
         await event_logger.capture(
             event="error_occurred",
             distinct_id=_distinct_id(message),
-            properties={"error_type": "UnsupportedDocumentType", "step": "document_validation"},
+            properties={
+                "error_type": "UnsupportedDocumentType",
+                "step": "document_validation",
+            },
         )
         return
 
@@ -236,8 +251,9 @@ async def handle_text(message: Message) -> None:
         await with_telegram_retries(
             lambda: message.answer(
                 "Выбери режим обработки ссылки:\n"
-                "🧾 Почти дословно — near-verbatim\n"
-                "🎧 Чистый для озвучки — readable cleaned",
+                "🧾 Близко к оригиналу\n"
+                "🎧 Под слух\n"
+                "⚡ Коротко под слух",
                 reply_markup=keyboard,
             ),
             retries=settings.telegram_api_retries,
@@ -254,7 +270,10 @@ async def handle_text(message: Message) -> None:
         pending_url = _pending_url_by_user.pop(message.from_user.id, None)
         if pending_url:
             status = await with_telegram_retries(
-                lambda: message.answer("Извлекаю статью и синтезирую аудио...", reply_markup=ReplyKeyboardRemove()),
+                lambda: message.answer(
+                    "Извлекаю статью и синтезирую аудио...",
+                    reply_markup=ReplyKeyboardRemove(),
+                ),
                 retries=settings.telegram_api_retries,
             )
             await _generate_and_send_audio(
@@ -275,7 +294,7 @@ async def handle_text(message: Message) -> None:
         status_message=status,
         raw_text=message.text,
         pdf_path=None,
-        url_mode=MODE_NEAR_VERBATIM,
+        url_mode=MODE_CLOSE_TO_SOURCE,
     )
 
 
@@ -284,7 +303,7 @@ async def _generate_and_send_audio(
     status_message: Message | None,
     raw_text: str | None,
     pdf_path: Path | None,
-    url_mode: ArticleMode = MODE_NEAR_VERBATIM,
+    url_mode: ArticleMode = MODE_CLOSE_TO_SOURCE,
 ) -> None:
     started_at = time.perf_counter()
     try:
@@ -328,7 +347,11 @@ async def _generate_and_send_audio(
             await event_logger.capture(
                 event="error_occurred",
                 distinct_id=_distinct_id(message),
-                properties={"error_type": "EmptyResolvedText", "step": "extract_text", "source": resolved_source},
+                properties={
+                    "error_type": "EmptyResolvedText",
+                    "step": "extract_text",
+                    "source": resolved_source,
+                },
             )
             return
 
@@ -365,7 +388,11 @@ async def _generate_and_send_audio(
             await event_logger.capture(
                 event="error_occurred",
                 distinct_id=_distinct_id(message),
-                properties={"error_type": "EmptyChunks", "step": "split_text", "source": resolved_source},
+                properties={
+                    "error_type": "EmptyChunks",
+                    "step": "split_text",
+                    "source": resolved_source,
+                },
             )
             return
 
@@ -395,7 +422,11 @@ async def _generate_and_send_audio(
             await event_logger.capture(
                 event="llm output_sent_to_tts",
                 distinct_id=_distinct_id(message),
-                properties={"flow": "article_to_tts", "source_type": "url", "char_count": len(text)},
+                properties={
+                    "flow": "article_to_tts",
+                    "source_type": "url",
+                    "char_count": len(text),
+                },
             )
 
         with tempfile.TemporaryDirectory() as tmpdir:
