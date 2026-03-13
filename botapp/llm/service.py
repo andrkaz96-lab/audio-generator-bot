@@ -53,7 +53,8 @@ class ArticleTTSResult:
 class VerificationResult:
     status: str
     repaired_text: str
-    notes: str
+    reason: str
+    unsupported_claims: list[str]
 
 
 class ArticleLLMService:
@@ -80,6 +81,9 @@ class ArticleLLMService:
         body_text: str,
         source_url: str | None = None,
         mode: str = MODE_CLOSE_TO_SOURCE,
+        target_duration_sec: int | None = None,
+        hard_cap_sec: int | None = None,
+        word_budget: int | None = None,
     ) -> ArticleTTSResult:
         mode = canonical_mode(mode)
         body = self._cleanup_body(body_text)
@@ -109,7 +113,13 @@ class ArticleLLMService:
         for index, chunk in enumerate(chunks):
             chunk_title = title if index == 0 else None
             chunk_result = await self.client.normalize_article(
-                title=chunk_title, body_text=chunk, source_url=source_url, mode=mode
+                title=chunk_title,
+                body_text=chunk,
+                source_url=source_url,
+                mode=mode,
+                target_duration_sec=target_duration_sec,
+                hard_cap_sec=hard_cap_sec,
+                word_budget=word_budget,
             )
             prompt_tokens += chunk_result.estimated_prompt_tokens
             completion_tokens += chunk_result.estimated_completion_tokens
@@ -161,23 +171,30 @@ class ArticleLLMService:
         mode = canonical_mode(mode)
         if mode not in {MODE_AUDIO_ADAPTED, MODE_AUDIO_SUMMARY}:
             return VerificationResult(
-                status="pass", repaired_text=draft_text, notes="skipped"
+                status="pass",
+                repaired_text=draft_text,
+                reason="skipped",
+                unsupported_claims=[],
             )
 
-        deterministic = self._deterministic_verify(
+        deterministic_claims = self._deterministic_verify(
             source_body=source_body, draft_text=draft_text
         )
-        if deterministic == "pass" and (
+        if not deterministic_claims and (
             not self.enabled or self.provider != "yandex" or self.client is None
         ):
             return VerificationResult(
-                status="pass", repaired_text=draft_text, notes="deterministic"
+                status="pass",
+                repaired_text=draft_text,
+                reason="deterministic",
+                unsupported_claims=[],
             )
         if not self.enabled or self.provider != "yandex" or self.client is None:
             return VerificationResult(
                 status="failed",
                 repaired_text=self._assemble_text(source_title, source_body),
-                notes="llm_unavailable",
+                reason="llm_unavailable",
+                unsupported_claims=deterministic_claims,
             )
 
         verifier_user = build_verifier_prompt(
@@ -193,27 +210,35 @@ class ArticleLLMService:
             return VerificationResult(
                 status="failed",
                 repaired_text=self._assemble_text(source_title, source_body),
-                notes="verifier_error",
+                reason="verifier_error",
+                unsupported_claims=deterministic_claims,
             )
 
         parsed = self._parse_verifier_output(raw.output_text)
         if parsed["decision"] == "pass":
             return VerificationResult(
-                status="pass", repaired_text=draft_text, notes=parsed["notes"]
+                status="pass",
+                repaired_text=draft_text,
+                reason=parsed["reason"],
+                unsupported_claims=[],
             )
-        if parsed["decision"] == "repair" and parsed["repaired_text"].strip():
-            repaired = parsed["repaired_text"].strip()
-            if (
-                self._deterministic_verify(source_body=source_body, draft_text=repaired)
-                == "pass"
+        if parsed["decision"] == "repair" and str(parsed["repaired_text"]).strip():
+            repaired = str(parsed["repaired_text"]).strip()
+            if not self._deterministic_verify(
+                source_body=source_body, draft_text=repaired
             ):
                 return VerificationResult(
-                    status="repaired", repaired_text=repaired, notes=parsed["notes"]
+                    status="repaired",
+                    repaired_text=repaired,
+                    reason=str(parsed["reason"]),
+                    unsupported_claims=[str(x) for x in parsed["unsupported_claims"]],
                 )
         return VerificationResult(
             status="failed",
             repaired_text=self._assemble_text(source_title, source_body),
-            notes=parsed["notes"],
+            reason=str(parsed["reason"]),
+            unsupported_claims=deterministic_claims
+            or [str(x) for x in parsed["unsupported_claims"]],
         )
 
     def analytics_properties(
@@ -267,23 +292,57 @@ class ArticleLLMService:
         safe_title = (title or "").strip() or "Без названия"
         return f"{safe_title}\n\n{body.strip()}".strip()
 
-    def _deterministic_verify(self, *, source_body: str, draft_text: str) -> str:
-        draft_numbers = set(re.findall(r"\b\d+[\d.,%]*\b", draft_text))
-        source_numbers = set(re.findall(r"\b\d+[\d.,%]*\b", source_body))
-        if draft_numbers - source_numbers:
-            return "repair"
-        return "pass"
+    def _strip_title_block(self, text: str) -> str:
+        lines = text.splitlines()
+        if len(lines) >= 2 and lines[1].strip() == "":
+            return "\n".join(lines[2:]).strip()
+        return text.strip()
 
-    def _parse_verifier_output(self, text: str) -> dict[str, str]:
+    def _extract_claim_markers(self, text: str) -> set[str]:
+        numbers = set(re.findall(r"\b\d+[\d.,%]*\b", text))
+        years = set(re.findall(r"\b(?:19|20)\d{2}\b", text))
+        named_like = {
+            m.group(0).strip()
+            for m in re.finditer(r"\b[А-ЯЁA-Z][а-яёa-z]+\s+[А-ЯЁA-Z][а-яёa-z]+\b", text)
+        }
+        quotes = {q.strip() for q in re.findall(r"[«\"]([^»\"]{8,120})[»\"]", text)}
+        causals = {
+            c.strip()
+            for c in re.findall(
+                r"[^.!?]{0,80}(?:потому что|поэтому|в результате|из-за|привело к|следовательно)[^.!?]{0,80}",
+                text,
+                flags=re.IGNORECASE,
+            )
+        }
+        return numbers | years | named_like | quotes | causals
+
+    def _deterministic_verify(self, *, source_body: str, draft_text: str) -> list[str]:
+        source_markers = self._extract_claim_markers(
+            self._strip_title_block(source_body)
+        )
+        draft_markers = self._extract_claim_markers(self._strip_title_block(draft_text))
+        unsupported = sorted(m for m in draft_markers if m and m not in source_markers)
+        return unsupported[:20]
+
+    def _parse_verifier_output(self, text: str) -> dict[str, object]:
         try:
             payload = json.loads(text)
+            unsupported_claims = payload.get("unsupported_claims", [])
+            if not isinstance(unsupported_claims, list):
+                unsupported_claims = []
             return {
                 "decision": payload.get("decision", "fail"),
-                "notes": payload.get("notes", ""),
+                "reason": payload.get("reason", ""),
+                "unsupported_claims": [str(x) for x in unsupported_claims],
                 "repaired_text": payload.get("repaired_text", ""),
             }
         except Exception:
-            return {"decision": "fail", "notes": "bad_json", "repaired_text": ""}
+            return {
+                "decision": "fail",
+                "reason": "bad_json",
+                "unsupported_claims": [],
+                "repaired_text": "",
+            }
 
     def _chunk_paragraphs(
         self, *, title: str | None, paragraphs: list[str]

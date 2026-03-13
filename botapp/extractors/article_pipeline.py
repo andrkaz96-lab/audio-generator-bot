@@ -36,6 +36,11 @@ HARD_CAP_SECONDS = {
     MODE_AUDIO_SUMMARY: 3 * 60,
 }
 
+WORD_BUDGET_RATIO = {
+    MODE_AUDIO_ADAPTED: 0.95,
+    MODE_AUDIO_SUMMARY: 0.5,
+}
+
 _BOILERPLATE_MARKERS = (
     "подпис",
     "читайте также",
@@ -164,6 +169,13 @@ def _hard_trim_to_duration(text: str, hard_cap_sec: int) -> tuple[str, bool]:
     return (" ".join(out) if out else text[:1200]).strip(), True
 
 
+def _word_budget_for_mode(body_text: str, mode: str) -> int | None:
+    ratio = WORD_BUDGET_RATIO.get(mode)
+    if ratio is None:
+        return None
+    return max(120, int(_word_count(body_text) * ratio))
+
+
 def _strip_emoji(text: str) -> str:
     return _EMOJI_RE.sub("", text)
 
@@ -241,6 +253,9 @@ async def run_article_pipeline(
             body_text=content.body_text,
             source_url=url,
             mode=resolved_mode,
+            target_duration_sec=SOFT_TARGET_SECONDS.get(resolved_mode),
+            hard_cap_sec=HARD_CAP_SECONDS.get(resolved_mode),
+            word_budget=_word_budget_for_mode(content.body_text, resolved_mode),
         )
         llm_used = not llm_result.used_fallback
         text = llm_result.final_text if llm_result.final_text.strip() else text
@@ -263,13 +278,22 @@ async def run_article_pipeline(
 
     if soft_target and estimate_audio_duration(text) > soft_target:
         compression_attempts += 1
+        compression_mode = (
+            MODE_AUDIO_SUMMARY if resolved_mode == MODE_AUDIO_ADAPTED else resolved_mode
+        )
         compressed = await llm_service.build_tts_text_for_article(
             title=content.title,
             body_text=content.body_text,
             source_url=url,
-            mode=resolved_mode,
+            mode=compression_mode,
+            target_duration_sec=soft_target,
+            hard_cap_sec=hard_cap,
+            word_budget=_word_budget_for_mode(content.body_text, compression_mode),
         )
-        if compressed.final_text.strip():
+        if compressed.final_text.strip() and (
+            estimate_audio_duration(compressed.final_text)
+            < estimate_audio_duration(text)
+        ):
             text = compressed.final_text
 
     if hard_cap and estimate_audio_duration(text) > hard_cap:

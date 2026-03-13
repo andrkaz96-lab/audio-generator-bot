@@ -64,7 +64,10 @@ class PipelineFlowTests(unittest.IsolatedAsyncioTestCase):
             final_text="Заголовок\n\nАдаптированный текст", used_fallback=False
         )
         verify_result = AsyncMock(
-            status="pass", repaired_text="Заголовок\n\nАдаптированный текст", notes="ok"
+            status="pass",
+            repaired_text="Заголовок\n\nАдаптированный текст",
+            reason="ok",
+            unsupported_claims=[],
         )
         llm_service = AsyncMock()
         llm_service.build_tts_text_for_article = AsyncMock(return_value=llm_result)
@@ -92,7 +95,9 @@ class PipelineFlowTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(llm_service.verify_and_repair.await_count, 2)
 
     async def test_emoji_and_bullets_normalized(self):
-        body = "• Первый пункт 😀\n• Второй пункт 😎\n\n" + " ".join(["Обычный абзац с достаточным количеством слов."] * 30)
+        body = "• Первый пункт 😀\n• Второй пункт 😎\n\n" + " ".join(
+            ["Обычный абзац с достаточным количеством слов."] * 30
+        )
         content = ArticleContent(
             title="Тест", body_text=body, full_text=f"Тест\n\n{body}"
         )
@@ -135,7 +140,10 @@ class PipelineFlowTests(unittest.IsolatedAsyncioTestCase):
         )
         llm_result = AsyncMock(final_text=f"Заголовок\n\n{body}", used_fallback=False)
         verify_result = AsyncMock(
-            status="pass", repaired_text=f"Заголовок\n\n{body}", notes="ok"
+            status="pass",
+            repaired_text=f"Заголовок\n\n{body}",
+            reason="ok",
+            unsupported_claims=[],
         )
         llm_service = AsyncMock()
         llm_service.build_tts_text_for_article = AsyncMock(return_value=llm_result)
@@ -152,6 +160,145 @@ class PipelineFlowTests(unittest.IsolatedAsyncioTestCase):
             )
         self.assertTrue(result.processing_trace.hard_trim_applied)
         self.assertLessEqual(result.processing_trace.estimated_duration_after, 180)
+
+    async def test_alias_modes_are_preserved(self):
+        body = " ".join(["Текст для проверки алиасов и обратной совместимости."] * 120)
+        content = ArticleContent(
+            title="Заголовок", body_text=body, full_text=f"Заголовок\n\n{body}"
+        )
+        llm_result = AsyncMock(
+            final_text="Заголовок\n\nАдаптированный текст", used_fallback=False
+        )
+        verify_result = AsyncMock(
+            status="pass",
+            repaired_text="Заголовок\n\nАдаптированный текст",
+            reason="ok",
+            unsupported_claims=[],
+        )
+        llm_service = AsyncMock()
+        llm_service.build_tts_text_for_article = AsyncMock(return_value=llm_result)
+        llm_service.verify_and_repair = AsyncMock(return_value=verify_result)
+        with patch(
+            "botapp.extractors.article_pipeline.fetch_article_content",
+            AsyncMock(return_value=content),
+        ):
+            near = await run_article_pipeline(
+                url="https://example.com/article",
+                mode="near_verbatim",
+                timeout_seconds=10,
+                llm_service=llm_service,
+            )
+            readable = await run_article_pipeline(
+                url="https://example.com/article",
+                mode="readable_cleaned",
+                timeout_seconds=10,
+                llm_service=llm_service,
+            )
+        self.assertEqual(near.mode, "close_to_source")
+        self.assertEqual(readable.mode, "audio_adapted")
+
+    async def test_audio_modes_use_different_budgets(self):
+        body = " ".join(
+            ["Длинный текст для проверки разных бюджетов по режимам."] * 500
+        )
+        content = ArticleContent(
+            title="Заголовок", body_text=body, full_text=f"Заголовок\n\n{body}"
+        )
+        llm_result = AsyncMock(
+            final_text="Заголовок\n\nАдаптированный текст", used_fallback=False
+        )
+        verify_result = AsyncMock(
+            status="pass",
+            repaired_text="Заголовок\n\nАдаптированный текст",
+            reason="ok",
+            unsupported_claims=[],
+        )
+        llm_service = AsyncMock()
+        llm_service.build_tts_text_for_article = AsyncMock(return_value=llm_result)
+        llm_service.verify_and_repair = AsyncMock(return_value=verify_result)
+        with patch(
+            "botapp.extractors.article_pipeline.fetch_article_content",
+            AsyncMock(return_value=content),
+        ):
+            await run_article_pipeline(
+                url="https://example.com/article",
+                mode="audio_adapted",
+                timeout_seconds=10,
+                llm_service=llm_service,
+            )
+            await run_article_pipeline(
+                url="https://example.com/article",
+                mode="audio_summary",
+                timeout_seconds=10,
+                llm_service=llm_service,
+            )
+        adapted_budget = llm_service.build_tts_text_for_article.await_args_list[
+            0
+        ].kwargs["word_budget"]
+        summary_budget = llm_service.build_tts_text_for_article.await_args_list[
+            1
+        ].kwargs["word_budget"]
+        self.assertGreater(adapted_budget, summary_budget)
+
+    async def test_long_article_mode_outputs_have_different_density(self):
+        body = " ".join([f"Факт {i} с пояснением и контекстом." for i in range(1, 800)])
+        content = ArticleContent(
+            title="Заголовок", body_text=body, full_text=f"Заголовок\n\n{body}"
+        )
+        adapted_text = "Заголовок\n\n" + " ".join(
+            [f"Факт {i} с пояснением." for i in range(1, 700)]
+        )
+        summary_text = "Заголовок\n\n" + " ".join([f"Факт {i}." for i in range(1, 320)])
+        llm_service = AsyncMock()
+
+        async def _build(**kwargs):
+            mode = kwargs.get("mode")
+            if mode == "audio_summary":
+                return AsyncMock(final_text=summary_text, used_fallback=False)
+            return AsyncMock(final_text=adapted_text, used_fallback=False)
+
+        async def _verify(**kwargs):
+            mode = kwargs.get("mode")
+            if mode == "audio_summary":
+                return AsyncMock(
+                    status="pass",
+                    repaired_text=summary_text,
+                    reason="ok",
+                    unsupported_claims=[],
+                )
+            return AsyncMock(
+                status="pass",
+                repaired_text=adapted_text,
+                reason="ok",
+                unsupported_claims=[],
+            )
+
+        llm_service.verify_and_repair = AsyncMock(side_effect=_verify)
+        llm_service.build_tts_text_for_article = AsyncMock(side_effect=_build)
+        with patch(
+            "botapp.extractors.article_pipeline.fetch_article_content",
+            AsyncMock(return_value=content),
+        ):
+            adapted = await run_article_pipeline(
+                url="https://example.com/article",
+                mode="audio_adapted",
+                timeout_seconds=10,
+                llm_service=llm_service,
+            )
+            summary = await run_article_pipeline(
+                url="https://example.com/article",
+                mode="audio_summary",
+                timeout_seconds=10,
+                llm_service=llm_service,
+            )
+        self.assertGreater(
+            adapted.metadata["word_count"], summary.metadata["word_count"]
+        )
+        source_words = len(body.split())
+        self.assertGreaterEqual(
+            adapted.metadata["word_count"], int(source_words * 0.12)
+        )
+        self.assertLessEqual(summary.metadata["word_count"], int(source_words * 0.1))
 
 
 if __name__ == "__main__":
