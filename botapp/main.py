@@ -69,6 +69,8 @@ MODE_BUTTON_TO_VALUE: dict[str, ArticleMode] = {
     "🧾 Близко к оригиналу": MODE_CLOSE_TO_SOURCE,
     "🎧 Под слух": MODE_AUDIO_ADAPTED,
     "⚡ Коротко под слух": MODE_AUDIO_SUMMARY,
+}
+LEGACY_MODE_BUTTON_TO_VALUE: dict[str, ArticleMode] = {
     "🧾 Почти дословно": MODE_CLOSE_TO_SOURCE,
     "🎧 Чистый для озвучки": MODE_AUDIO_ADAPTED,
 }
@@ -265,7 +267,10 @@ async def handle_text(message: Message) -> None:
         )
         return
 
-    mode = MODE_BUTTON_TO_VALUE.get((message.text or "").strip())
+    selected_mode_label = (message.text or "").strip()
+    mode = MODE_BUTTON_TO_VALUE.get(
+        selected_mode_label
+    ) or LEGACY_MODE_BUTTON_TO_VALUE.get(selected_mode_label)
     if mode and message.from_user:
         pending_url = _pending_url_by_user.pop(message.from_user.id, None)
         if pending_url:

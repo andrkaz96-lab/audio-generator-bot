@@ -28,17 +28,17 @@ Decision = Literal["pass", "pass_with_warnings", "llm_fallback"]
 Status = Literal["ok", "partial", "failed"]
 
 SOFT_TARGET_SECONDS = {
-    MODE_AUDIO_ADAPTED: 14 * 60,
-    MODE_AUDIO_SUMMARY: 160,
+    MODE_AUDIO_ADAPTED: None,
+    MODE_AUDIO_SUMMARY: 170,
 }
 HARD_CAP_SECONDS = {
-    MODE_AUDIO_ADAPTED: 15 * 60,
+    MODE_AUDIO_ADAPTED: None,
     MODE_AUDIO_SUMMARY: 3 * 60,
 }
 
 WORD_BUDGET_RATIO = {
-    MODE_AUDIO_ADAPTED: 0.95,
-    MODE_AUDIO_SUMMARY: 0.5,
+    MODE_AUDIO_ADAPTED: 0.9,
+    MODE_AUDIO_SUMMARY: 0.22,
 }
 
 _BOILERPLATE_MARKERS = (
@@ -278,17 +278,14 @@ async def run_article_pipeline(
 
     if soft_target and estimate_audio_duration(text) > soft_target:
         compression_attempts += 1
-        compression_mode = (
-            MODE_AUDIO_SUMMARY if resolved_mode == MODE_AUDIO_ADAPTED else resolved_mode
-        )
         compressed = await llm_service.build_tts_text_for_article(
             title=content.title,
             body_text=content.body_text,
             source_url=url,
-            mode=compression_mode,
+            mode=resolved_mode,
             target_duration_sec=soft_target,
             hard_cap_sec=hard_cap,
-            word_budget=_word_budget_for_mode(content.body_text, compression_mode),
+            word_budget=_word_budget_for_mode(content.body_text, resolved_mode),
         )
         if compressed.final_text.strip() and (
             estimate_audio_duration(compressed.final_text)
