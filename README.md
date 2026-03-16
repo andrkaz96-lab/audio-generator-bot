@@ -142,10 +142,32 @@
 ```bash
 python3 -m venv .venv
 source .venv/bin/activate
-pip install -r requirements.txt
+pip install --no-cache-dir -r requirements.txt
 python -m botapp.main
 ```
 
+
+
+### Установка на CPU-only VM (без переполнения диска)
+
+В `requirements.txt` уже зафиксирован CPU-only PyTorch для Linux (`torch==2.5.1+cpu`)
+и добавлен индекс `https://download.pytorch.org/whl/cpu`, чтобы не подтягивались CUDA-пакеты.
+
+Рекомендуемый порядок:
+
+```bash
+python3 -m venv .venv
+source .venv/bin/activate
+pip install --upgrade pip
+pip install --no-cache-dir -r requirements.txt
+```
+
+Если ранее была неудачная установка, очистите окружение перед повтором:
+
+```bash
+deactivate 2>/dev/null || true
+rm -rf .venv ~/.cache/pip
+```
 
 ## Надёжность TTS (Silero + fallback)
 
