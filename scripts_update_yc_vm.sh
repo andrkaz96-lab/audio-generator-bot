@@ -64,7 +64,7 @@ echo "[5/8] Upgrading pip..."
 python -m pip install --upgrade pip
 
 echo "[6/8] Installing dependencies..."
-pip install -r requirements.txt
+pip install --no-cache-dir -r requirements.txt
 
 echo "[7/8] Restarting service $SERVICE_NAME ..."
 sudo systemctl restart "$SERVICE_NAME"

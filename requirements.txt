@@ -1,3 +1,5 @@
+--extra-index-url https://download.pytorch.org/whl/cpu
+
 aiogram==3.18.0
 python-dotenv==1.0.1
 httpx==0.28.1
@@ -9,5 +11,6 @@ gTTS==2.5.4
 edge-tts>=7,<8
 numpy==1.26.4
 lameenc==1.8.1
-torch>=2.2,<3
+torch==2.5.1+cpu ; platform_system == "Linux"
+torch>=2.2,<3 ; platform_system != "Linux"
 omegaconf==2.3.0
