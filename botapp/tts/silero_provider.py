@@ -4,6 +4,7 @@ import asyncio
 import logging
 import re
 import subprocess
+import time
 from pathlib import Path
 from typing import Optional
 
@@ -33,7 +34,11 @@ class SileroTTSProvider(TTSProvider):
         self._model_speaker = model_speaker
         self._model: Optional[torch.nn.Module] = None
         self._max_chars_per_call = 900
-        self._repo_dir = Path(repo_dir).expanduser() if repo_dir else Path.home() / ".cache" / "audio-generator-bot" / "silero-models"
+        self._repo_dir = (
+            Path(repo_dir).expanduser()
+            if repo_dir
+            else Path.home() / ".cache" / "audio-generator-bot" / "silero-models"
+        )
         self._allow_download_on_startup = allow_download_on_startup
 
     async def preload(self) -> None:
@@ -44,12 +49,32 @@ class SileroTTSProvider(TTSProvider):
 
     def _synthesize_sync(self, text: str) -> bytes:
         if self._model is None:
-            raise RuntimeError("Silero model is not preloaded. Check startup logs and SILERO_REPO_DIR.")
+            raise RuntimeError(
+                "Silero model is not preloaded. Check startup logs and SILERO_REPO_DIR."
+            )
         model = self._model
         parts = self._split_text(text, self._max_chars_per_call)
-        audio_chunks: list[np.ndarray] = []
+        started_at = time.monotonic()
 
-        for part in parts:
+        encoder = lameenc.Encoder()
+        encoder.set_bit_rate(128)
+        encoder.set_in_sample_rate(self._sample_rate)
+        encoder.set_channels(1)
+        encoder.set_quality(2)
+
+        encoded_parts: list[bytes] = []
+        pause_pcm16 = self._pcm16(
+            np.zeros(int(self._sample_rate * 0.12), dtype=np.float32)
+        )
+
+        logger.info(
+            "silero tts synth started: chars=%s parts=%s",
+            len(text),
+            len(parts),
+        )
+
+        for idx, part in enumerate(parts, start=1):
+            part_started_at = time.monotonic()
             audio = model.apply_tts(
                 text=part,
                 speaker=self._speaker,
@@ -57,20 +82,31 @@ class SileroTTSProvider(TTSProvider):
                 put_accent=True,
                 put_yo=True,
             )
-            audio_chunks.append(audio.detach().cpu().numpy())
+            encoded_parts.append(
+                encoder.encode(self._pcm16(audio.detach().cpu().numpy()))
+            )
+            if idx < len(parts):
+                encoded_parts.append(encoder.encode(pause_pcm16))
 
-        if not audio_chunks:
+            logger.info(
+                "silero tts part completed: part=%s/%s chars=%s duration_sec=%.3f",
+                idx,
+                len(parts),
+                len(part),
+                time.monotonic() - part_started_at,
+            )
+
+        if not encoded_parts:
             return self._encode_mp3(np.array([], dtype=np.float32))
 
-        pause = np.zeros(int(self._sample_rate * 0.12), dtype=np.float32)
-        merged: list[np.ndarray] = []
-        for idx, chunk in enumerate(audio_chunks):
-            merged.append(chunk)
-            if idx < len(audio_chunks) - 1:
-                merged.append(pause)
-
-        samples = np.concatenate(merged)
-        return self._encode_mp3(samples)
+        encoded_parts.append(encoder.flush())
+        logger.info(
+            "silero tts synth completed: chars=%s parts=%s duration_sec=%.3f",
+            len(text),
+            len(parts),
+            time.monotonic() - started_at,
+        )
+        return b"".join(encoded_parts)
 
     def _ensure_model_loaded(self, startup_phase: bool = False):
         if self._model is not None:
@@ -119,13 +155,19 @@ class SileroTTSProvider(TTSProvider):
     def _clone_silero_repo(self) -> None:
         self._repo_dir.parent.mkdir(parents=True, exist_ok=True)
         subprocess.run(
-            ["git", "clone", "--depth", "1", "https://github.com/snakers4/silero-models.git", str(self._repo_dir)],
+            [
+                "git",
+                "clone",
+                "--depth",
+                "1",
+                "https://github.com/snakers4/silero-models.git",
+                str(self._repo_dir),
+            ],
             check=True,
         )
 
     def _encode_mp3(self, samples: np.ndarray) -> bytes:
-        clipped = np.clip(samples, -1.0, 1.0)
-        pcm16 = (clipped * 32767.0).astype(np.int16).tobytes()
+        pcm16 = self._pcm16(samples)
 
         encoder = lameenc.Encoder()
         encoder.set_bit_rate(128)
@@ -134,6 +176,10 @@ class SileroTTSProvider(TTSProvider):
         encoder.set_quality(2)
 
         return encoder.encode(pcm16) + encoder.flush()
+
+    def _pcm16(self, samples: np.ndarray) -> bytes:
+        clipped = np.clip(samples, -1.0, 1.0)
+        return (clipped * 32767.0).astype(np.int16).tobytes()
 
     def _split_text(self, text: str, max_chars: int) -> list[str]:
         cleaned = " ".join(text.split()).strip()
