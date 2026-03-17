@@ -75,6 +75,7 @@ LEGACY_MODE_BUTTON_TO_VALUE: dict[str, ArticleMode] = {
     "🎧 Чистый для озвучки": MODE_AUDIO_ADAPTED,
 }
 _pending_url_by_user: dict[int, str] = {}
+ONE_SHOT_TTS_CHAR_LIMIT = 1200
 
 
 async def with_telegram_retries(
@@ -314,11 +315,22 @@ async def _generate_and_send_audio(
     try:
         maybe_url = extract_url(raw_text or "")
         if maybe_url and pdf_path is None:
+            extraction_started_at = time.monotonic()
+            logger.info(
+                "link pipeline extraction start: url=%s mode=%s", maybe_url, url_mode
+            )
             pipeline_result = await run_article_pipeline(
                 url=maybe_url,
                 mode=url_mode,
                 timeout_seconds=settings.request_timeout_seconds,
                 llm_service=llm_service,
+            )
+            logger.info(
+                "link pipeline extraction completed: url=%s mode=%s chars=%s duration_sec=%.3f",
+                maybe_url,
+                url_mode,
+                len(pipeline_result.text),
+                time.monotonic() - extraction_started_at,
             )
             text = pipeline_result.text[: settings.max_input_chars]
             resolved_source = "url"
@@ -335,10 +347,18 @@ async def _generate_and_send_audio(
                 },
             )
         else:
+            extraction_started_at = time.monotonic()
+            logger.info("input resolve start: has_pdf=%s", bool(pdf_path))
             resolved = await resolve_input_text(
                 raw_text=raw_text,
                 pdf_local_path=pdf_path,
                 timeout_seconds=settings.request_timeout_seconds,
+            )
+            logger.info(
+                "input resolve completed: source=%s chars=%s duration_sec=%.3f",
+                resolved.source,
+                len(resolved.text),
+                time.monotonic() - extraction_started_at,
             )
             text = resolved.text[: settings.max_input_chars]
             resolved_source = resolved.source
@@ -383,7 +403,17 @@ async def _generate_and_send_audio(
             properties={"char_count": len(text), "source": resolved_source},
         )
 
-        chunks = split_text_into_chunks(text, settings.max_chars_per_chunk)
+        use_one_shot = len(text) <= ONE_SHOT_TTS_CHAR_LIMIT
+        tts_chunk_size = len(text) if use_one_shot else settings.max_chars_per_chunk
+        chunks = split_text_into_chunks(text, tts_chunk_size)
+        logger.info(
+            "tts start: source=%s text_chars=%s one_shot=%s chunk_size=%s chunks=%s",
+            resolved_source,
+            len(text),
+            use_one_shot,
+            tts_chunk_size,
+            len(chunks),
+        )
         if not chunks:
             status_message = await safe_update_status(
                 status_message=status_message,
@@ -401,16 +431,99 @@ async def _generate_and_send_audio(
             )
             return
 
-        audio_parts: list[bytes] = []
-        for idx, chunk in enumerate(chunks, start=1):
-            status_message = await safe_update_status(
-                status_message=status_message,
-                text=f"Синтез {idx}/{len(chunks)}...",
-                fallback_message_source=message,
-            )
-            audio_parts.append(await tts_provider.synthesize(chunk))
+        with tempfile.TemporaryDirectory() as tmpdir:
+            out_path = Path(tmpdir) / "speech.mp3"
+            with out_path.open("wb") as output_file:
+                for idx, chunk in enumerate(chunks, start=1):
+                    chunk_started_at = time.monotonic()
+                    logger.info(
+                        "tts chunk start: chunk=%s/%s chars=%s",
+                        idx,
+                        len(chunks),
+                        len(chunk),
+                    )
+                    status_message = await safe_update_status(
+                        status_message=status_message,
+                        text=f"Синтез {idx}/{len(chunks)}...",
+                        fallback_message_source=message,
+                    )
+                    try:
+                        audio_part = await asyncio.wait_for(
+                            tts_provider.synthesize(chunk),
+                            timeout=settings.telegram_api_timeout_seconds,
+                        )
+                    except TimeoutError:
+                        logger.exception(
+                            "tts chunk timeout: chunk=%s/%s chars=%s",
+                            idx,
+                            len(chunks),
+                            len(chunk),
+                        )
+                        raise
+                    except Exception:
+                        logger.exception(
+                            "tts chunk failed: chunk=%s/%s chars=%s",
+                            idx,
+                            len(chunks),
+                            len(chunk),
+                        )
+                        raise
+                    output_file.write(audio_part)
+                    logger.info(
+                        "tts chunk completed: chunk=%s/%s chars=%s audio_bytes=%s duration_sec=%.3f",
+                        idx,
+                        len(chunks),
+                        len(chunk),
+                        len(audio_part),
+                        time.monotonic() - chunk_started_at,
+                    )
+                    del audio_part
 
-        output = b"".join(audio_parts)
+            output_size = out_path.stat().st_size
+            logger.info(
+                "tts completed: chunks=%s output_bytes=%s",
+                len(chunks),
+                output_size,
+            )
+            logger.info(
+                "audio merge completed: chunks=%s output_bytes=%s",
+                len(chunks),
+                output_size,
+            )
+            logger.info(
+                "telegram send audio start: output_bytes=%s source=%s",
+                output_size,
+                resolved_source,
+            )
+            try:
+                await with_telegram_retries(
+                    lambda: asyncio.wait_for(
+                        message.answer_audio(
+                            audio=FSInputFile(out_path),
+                            caption=(
+                                "Готово. Источник: "
+                                f"{resolved_source}. Длина текста: {len(text)} символов."
+                            ),
+                        ),
+                        timeout=settings.telegram_api_timeout_seconds,
+                    ),
+                    retries=settings.telegram_api_retries,
+                )
+            except TimeoutError:
+                logger.exception(
+                    "telegram send audio timeout: output_bytes=%s source=%s",
+                    output_size,
+                    resolved_source,
+                )
+                raise
+            except Exception:
+                logger.exception(
+                    "telegram send audio failed: output_bytes=%s source=%s",
+                    output_size,
+                    resolved_source,
+                )
+                raise
+            logger.info("telegram send audio completed: output_bytes=%s", output_size)
         processing_time = round(time.perf_counter() - started_at, 3)
 
         await event_logger.capture(
@@ -434,17 +547,6 @@ async def _generate_and_send_audio(
                 },
             )
 
-        with tempfile.TemporaryDirectory() as tmpdir:
-            out_path = Path(tmpdir) / "speech.mp3"
-            out_path.write_bytes(output)
-            await with_telegram_retries(
-                lambda: message.answer_audio(
-                    audio=FSInputFile(out_path),
-                    caption=f"Готово. Источник: {resolved_source}. Длина текста: {len(text)} символов.",
-                ),
-                retries=settings.telegram_api_retries,
-            )
-
         await event_logger.capture(
             event="audio_downloaded",
             distinct_id=_distinct_id(message),
@@ -456,6 +558,13 @@ async def _generate_and_send_audio(
                 lambda: status_message.delete(),
                 retries=settings.telegram_api_retries,
             )
+        logger.info(
+            "pipeline completed successfully: source=%s chars=%s chunks=%s duration_sec=%.3f",
+            resolved_source,
+            len(text),
+            len(chunks),
+            time.perf_counter() - started_at,
+        )
 
     except Exception as exc:
         logger.exception("Failed to generate audio")

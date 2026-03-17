@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 import re
+import time
 from dataclasses import dataclass
 from typing import Literal
 from urllib.parse import urlparse
@@ -211,7 +212,16 @@ async def run_article_pipeline(
 ) -> PipelineResult:
     warnings: list[str] = []
     resolved_mode = canonical_mode(mode)
+    fetch_started_at = time.monotonic()
+    logger.info("article extraction start: url=%s mode=%s", url, resolved_mode)
     content = await fetch_article_content(url, timeout_seconds=timeout_seconds)
+    logger.info(
+        "article extraction completed: url=%s mode=%s body_chars=%s duration_sec=%.3f",
+        url,
+        resolved_mode,
+        len(content.body_text),
+        time.monotonic() - fetch_started_at,
+    )
     quality = evaluate_quality(title=content.title, body_text=content.body_text)
 
     if not content.body_text.strip() and resolved_mode in {
@@ -248,6 +258,13 @@ async def run_article_pipeline(
         resolved_mode in {MODE_AUDIO_ADAPTED, MODE_AUDIO_SUMMARY}
     ) or quality.decision == "llm_fallback"
     if should_use_llm:
+        llm_step1_started_at = time.monotonic()
+        logger.info(
+            "llm step 1 start: url=%s mode=%s body_chars=%s",
+            url,
+            resolved_mode,
+            len(content.body_text),
+        )
         llm_result = await llm_service.build_tts_text_for_article(
             title=content.title,
             body_text=content.body_text,
@@ -257,6 +274,13 @@ async def run_article_pipeline(
             hard_cap_sec=HARD_CAP_SECONDS.get(resolved_mode),
             word_budget=_word_budget_for_mode(content.body_text, resolved_mode),
         )
+        logger.info(
+            "llm step 1 completed: url=%s mode=%s output_chars=%s duration_sec=%.3f",
+            url,
+            resolved_mode,
+            len(llm_result.final_text),
+            time.monotonic() - llm_step1_started_at,
+        )
         llm_used = not llm_result.used_fallback
         text = llm_result.final_text if llm_result.final_text.strip() else text
 
@@ -265,11 +289,26 @@ async def run_article_pipeline(
     soft_target = SOFT_TARGET_SECONDS.get(resolved_mode)
 
     if resolved_mode in {MODE_AUDIO_ADAPTED, MODE_AUDIO_SUMMARY}:
+        llm_step2_started_at = time.monotonic()
+        logger.info(
+            "llm step 2 start: url=%s mode=%s draft_chars=%s",
+            url,
+            resolved_mode,
+            len(text),
+        )
         verify = await llm_service.verify_and_repair(
             source_title=content.title,
             source_body=content.body_text,
             draft_text=text,
             mode=resolved_mode,
+        )
+        logger.info(
+            "llm step 2 completed: url=%s mode=%s status=%s repaired_chars=%s duration_sec=%.3f",
+            url,
+            resolved_mode,
+            verify.status,
+            len(verify.repaired_text),
+            time.monotonic() - llm_step2_started_at,
         )
         verifier_status = verify.status
         text = verify.repaired_text
