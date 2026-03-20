@@ -22,13 +22,16 @@ class Settings:
     silero_sample_rate: int = 48000
     silero_model_language: str = "ru"
     silero_model_speaker: str = "v4_ru"
-    silero_repo_dir: str = str(Path.home() / ".cache" / "audio-generator-bot" / "silero-models")
+    silero_repo_dir: str = str(
+        Path.home() / ".cache" / "audio-generator-bot" / "silero-models"
+    )
     silero_allow_download_on_startup: bool = True
-    max_chars_per_chunk: int = 4000
-    max_input_chars: int = 60000
+    max_chars_per_chunk: int = 220
+    max_input_chars: int = 0
     request_timeout_seconds: int = 20
     telegram_api_timeout_seconds: int = 120
     telegram_api_retries: int = 3
+    tts_chunk_timeout_seconds: int = 45
     posthog_api_key: str = ""
     posthog_project_id: str = ""
     posthog_host: str = "https://app.posthog.com"
@@ -45,7 +48,6 @@ class Settings:
     llm_log_prompts: bool = False
 
 
-
 def load_settings() -> Settings:
     token = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
     if not token:
@@ -60,13 +62,21 @@ def load_settings() -> Settings:
         silero_sample_rate=int(os.getenv("SILERO_SAMPLE_RATE", "48000")),
         silero_model_language=os.getenv("SILERO_MODEL_LANGUAGE", "ru").strip(),
         silero_model_speaker=os.getenv("SILERO_MODEL_SPEAKER", "v4_ru").strip(),
-        silero_repo_dir=os.getenv("SILERO_REPO_DIR", str(Path.home() / ".cache" / "audio-generator-bot" / "silero-models")).strip(),
-        silero_allow_download_on_startup=_as_bool("SILERO_ALLOW_DOWNLOAD_ON_STARTUP", "true"),
-        max_chars_per_chunk=int(os.getenv("MAX_CHARS_PER_CHUNK", "4000")),
-        max_input_chars=int(os.getenv("MAX_INPUT_CHARS", "60000")),
+        silero_repo_dir=os.getenv(
+            "SILERO_REPO_DIR",
+            str(Path.home() / ".cache" / "audio-generator-bot" / "silero-models"),
+        ).strip(),
+        silero_allow_download_on_startup=_as_bool(
+            "SILERO_ALLOW_DOWNLOAD_ON_STARTUP", "true"
+        ),
+        max_chars_per_chunk=int(os.getenv("MAX_CHARS_PER_CHUNK", "220")),
+        max_input_chars=int(os.getenv("MAX_INPUT_CHARS", "0")),
         request_timeout_seconds=int(os.getenv("REQUEST_TIMEOUT_SECONDS", "20")),
-        telegram_api_timeout_seconds=int(os.getenv("TELEGRAM_API_TIMEOUT_SECONDS", "120")),
+        telegram_api_timeout_seconds=int(
+            os.getenv("TELEGRAM_API_TIMEOUT_SECONDS", "120")
+        ),
         telegram_api_retries=int(os.getenv("TELEGRAM_API_RETRIES", "3")),
+        tts_chunk_timeout_seconds=int(os.getenv("TTS_CHUNK_TIMEOUT_SECONDS", "45")),
         posthog_api_key=os.getenv("POSTHOG_API_KEY", "").strip(),
         posthog_project_id=os.getenv("POSTHOG_PROJECT_ID", "").strip(),
         posthog_host=os.getenv("POSTHOG_HOST", "https://app.posthog.com").strip(),
@@ -75,7 +85,9 @@ def load_settings() -> Settings:
         llm_provider=os.getenv("LLM_PROVIDER", "yandex").strip().lower(),
         yandex_api_key=os.getenv("YANDEX_API_KEY", "").strip(),
         yandex_folder_id=os.getenv("YANDEX_FOLDER_ID", "b1geq9r8nerbilj0i53p").strip(),
-        yandex_api_base=os.getenv("YANDEX_API_BASE", "https://llm.api.cloud.yandex.net/v1").strip(),
+        yandex_api_base=os.getenv(
+            "YANDEX_API_BASE", "https://llm.api.cloud.yandex.net/v1"
+        ).strip(),
         yandex_model=os.getenv("YANDEX_MODEL", "yandexgpt-lite/latest").strip(),
         llm_timeout_seconds=int(os.getenv("LLM_TIMEOUT_SECONDS", "30")),
         llm_max_input_chars=int(os.getenv("LLM_MAX_INPUT_CHARS", "18000")),

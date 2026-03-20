@@ -75,7 +75,23 @@ LEGACY_MODE_BUTTON_TO_VALUE: dict[str, ArticleMode] = {
     "🎧 Чистый для озвучки": MODE_AUDIO_ADAPTED,
 }
 _pending_url_by_user: dict[int, str] = {}
-ONE_SHOT_TTS_CHAR_LIMIT = 1200
+
+
+class UserVisibleError(RuntimeError):
+    def __init__(self, user_message: str) -> None:
+        super().__init__(user_message)
+        self.user_message = user_message
+
+
+class ProcessingTimeoutError(UserVisibleError):
+    def __init__(self, *, step: str, timeout_seconds: int) -> None:
+        super().__init__(
+            "Ошибка: операция зависла и была остановлена. "
+            f"Шаг: {step}. Таймаут: {timeout_seconds} сек. "
+            "Попробуйте повторить запрос или уменьшить объем текста."
+        )
+        self.step = step
+        self.timeout_seconds = timeout_seconds
 
 
 async def with_telegram_retries(
@@ -98,7 +114,7 @@ async def safe_update_status(
     status_message: Message | None,
     text: str,
     fallback_message_source: Message,
-) -> Message:
+) -> Message | None:
     chat_id = fallback_message_source.chat.id if fallback_message_source.chat else None
     status_message_id = status_message.message_id if status_message else None
     current_text = (status_message.text or "") if status_message else ""
@@ -152,6 +168,47 @@ async def safe_update_status(
             lambda: fallback_message_source.answer(text),
             retries=settings.telegram_api_retries,
         )
+
+
+async def _run_with_timeout(
+    operation: Awaitable[T],
+    *,
+    timeout_seconds: int,
+    step: str,
+) -> T:
+    try:
+        return await asyncio.wait_for(operation, timeout=timeout_seconds)
+    except asyncio.TimeoutError as exc:
+        logger.exception(
+            "operation timeout: step=%s timeout_seconds=%s",
+            step,
+            timeout_seconds,
+        )
+        raise ProcessingTimeoutError(
+            step=step,
+            timeout_seconds=timeout_seconds,
+        ) from exc
+
+
+def _prepare_tts_input(text: str) -> tuple[str, bool]:
+    max_input_chars = settings.max_input_chars
+    if max_input_chars <= 0 or len(text) <= max_input_chars:
+        return text, False
+
+    truncated = text[:max_input_chars]
+    logger.warning(
+        "tts input truncated: original_chars=%s truncated_chars=%s",
+        len(text),
+        len(truncated),
+    )
+    return truncated, True
+
+
+def _resolve_tts_chunk_size(text: str) -> int:
+    chunk_size = settings.max_chars_per_chunk
+    if chunk_size <= 0:
+        raise ValueError("MAX_CHARS_PER_CHUNK must be > 0")
+    return min(len(text), chunk_size) if text else chunk_size
 
 
 def _distinct_id(message: Message) -> str:
@@ -332,7 +389,7 @@ async def _generate_and_send_audio(
                 len(pipeline_result.text),
                 time.monotonic() - extraction_started_at,
             )
-            text = pipeline_result.text[: settings.max_input_chars]
+            text, input_was_truncated = _prepare_tts_input(pipeline_result.text)
             resolved_source = "url"
             await event_logger.capture(
                 event="url_pipeline_completed",
@@ -344,6 +401,7 @@ async def _generate_and_send_audio(
                     "llm_used": pipeline_result.processing_trace.llm_used,
                     "flags": ",".join(pipeline_result.quality_report.flags),
                     "warnings": ",".join(pipeline_result.warnings),
+                    "tts_input_truncated": input_was_truncated,
                 },
             )
         else:
@@ -360,7 +418,7 @@ async def _generate_and_send_audio(
                 len(resolved.text),
                 time.monotonic() - extraction_started_at,
             )
-            text = resolved.text[: settings.max_input_chars]
+            text, input_was_truncated = _prepare_tts_input(resolved.text)
             resolved_source = resolved.source
 
         if not text:
@@ -400,17 +458,19 @@ async def _generate_and_send_audio(
         await event_logger.capture(
             event="audio_generation_started",
             distinct_id=_distinct_id(message),
-            properties={"char_count": len(text), "source": resolved_source},
+            properties={
+                "char_count": len(text),
+                "source": resolved_source,
+                "tts_input_truncated": input_was_truncated,
+            },
         )
 
-        use_one_shot = len(text) <= ONE_SHOT_TTS_CHAR_LIMIT
-        tts_chunk_size = len(text) if use_one_shot else settings.max_chars_per_chunk
+        tts_chunk_size = _resolve_tts_chunk_size(text)
         chunks = split_text_into_chunks(text, tts_chunk_size)
         logger.info(
-            "tts start: source=%s text_chars=%s one_shot=%s chunk_size=%s chunks=%s",
+            "tts start: source=%s text_chars=%s chunk_size=%s chunks=%s",
             resolved_source,
             len(text),
-            use_one_shot,
             tts_chunk_size,
             len(chunks),
         )
@@ -448,18 +508,11 @@ async def _generate_and_send_audio(
                         fallback_message_source=message,
                     )
                     try:
-                        audio_part = await asyncio.wait_for(
+                        audio_part = await _run_with_timeout(
                             tts_provider.synthesize(chunk),
-                            timeout=settings.telegram_api_timeout_seconds,
+                            timeout_seconds=settings.tts_chunk_timeout_seconds,
+                            step=f"tts chunk {idx}/{len(chunks)}",
                         )
-                    except TimeoutError:
-                        logger.exception(
-                            "tts chunk timeout: chunk=%s/%s chars=%s",
-                            idx,
-                            len(chunks),
-                            len(chunk),
-                        )
-                        raise
                     except Exception:
                         logger.exception(
                             "tts chunk failed: chunk=%s/%s chars=%s",
@@ -497,7 +550,7 @@ async def _generate_and_send_audio(
             )
             try:
                 await with_telegram_retries(
-                    lambda: asyncio.wait_for(
+                    lambda: _run_with_timeout(
                         message.answer_audio(
                             audio=FSInputFile(out_path),
                             caption=(
@@ -505,17 +558,11 @@ async def _generate_and_send_audio(
                                 f"{resolved_source}. Длина текста: {len(text)} символов."
                             ),
                         ),
-                        timeout=settings.telegram_api_timeout_seconds,
+                        timeout_seconds=settings.telegram_api_timeout_seconds,
+                        step="telegram send audio",
                     ),
                     retries=settings.telegram_api_retries,
                 )
-            except TimeoutError:
-                logger.exception(
-                    "telegram send audio timeout: output_bytes=%s source=%s",
-                    output_size,
-                    resolved_source,
-                )
-                raise
             except Exception:
                 logger.exception(
                     "telegram send audio failed: output_bytes=%s source=%s",
@@ -568,11 +615,19 @@ async def _generate_and_send_audio(
 
     except Exception as exc:
         logger.exception("Failed to generate audio")
-        error_text = f"Ошибка: {type(exc).__name__}: {exc}"
+        error_text = (
+            exc.user_message
+            if isinstance(exc, UserVisibleError)
+            else f"Ошибка: {type(exc).__name__}: {exc}"
+        )
         await event_logger.capture(
             event="error_occurred",
             distinct_id=_distinct_id(message),
-            properties={"error_type": type(exc).__name__, "step": "pipeline"},
+            properties={
+                "error_type": type(exc).__name__,
+                "error_message": str(exc),
+                "step": getattr(exc, "step", "pipeline"),
+            },
         )
         await safe_update_status(
             status_message=status_message,
