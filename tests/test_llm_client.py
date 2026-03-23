@@ -43,12 +43,19 @@ class YandexClientRetryTests(unittest.IsolatedAsyncioTestCase):
     async def test_retries_on_429(self):
         responses = [
             FakeResponse(status_code=429),
-            FakeResponse(status_code=200, payload={"choices": [{"message": {"content": "A"}}]}),
+            FakeResponse(
+                status_code=200, payload={"choices": [{"message": {"content": "A"}}]}
+            ),
         ]
         calls = []
-        with patch("httpx.AsyncClient", side_effect=lambda *a, **k: FakeAsyncClient(responses, calls)):
+        with patch(
+            "httpx.AsyncClient",
+            side_effect=lambda *a, **k: FakeAsyncClient(responses, calls),
+        ):
             client = YandexLLMClient(api_key="k", folder_id="f")
-            result = await client.normalize_article(title="t", body_text="b", source_url="u")
+            result = await client.normalize_article(
+                title="t", body_text="b", source_url="u"
+            )
             self.assertTrue(result.success)
             self.assertEqual(result.retry_count, 1)
             self.assertTrue(calls[0][0][0].endswith("/v1/chat/completions"))
@@ -56,9 +63,14 @@ class YandexClientRetryTests(unittest.IsolatedAsyncioTestCase):
     async def test_no_retry_on_400(self):
         responses = [FakeResponse(status_code=400)]
         calls = []
-        with patch("httpx.AsyncClient", side_effect=lambda *a, **k: FakeAsyncClient(responses, calls)):
+        with patch(
+            "httpx.AsyncClient",
+            side_effect=lambda *a, **k: FakeAsyncClient(responses, calls),
+        ):
             client = YandexLLMClient(api_key="k", folder_id="f")
-            result = await client.normalize_article(title="t", body_text="b", source_url="u")
+            result = await client.normalize_article(
+                title="t", body_text="b", source_url="u"
+            )
             self.assertFalse(result.success)
             self.assertEqual(result.retry_count, 0)
             self.assertEqual(result.error_type, "HTTP_400")

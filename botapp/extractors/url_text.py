@@ -56,12 +56,12 @@ def _extract_from_json_ld(html: str) -> str:
     return max(candidates, key=len, default="")
 
 
-
-
 def _normalize_embedded_text(value: str) -> str:
     cleaned = _normalize_text(value)
     if "<" in cleaned and ">" in cleaned:
-        cleaned = _normalize_text(BeautifulSoup(cleaned, "html.parser").get_text(" ", strip=True))
+        cleaned = _normalize_text(
+            BeautifulSoup(cleaned, "html.parser").get_text(" ", strip=True)
+        )
     return cleaned
 
 
@@ -87,7 +87,15 @@ def _extract_from_embedded_data(html: str) -> str:
             for key, value in obj.items():
                 if isinstance(value, str) and any(
                     token in key.lower()
-                    for token in ("article", "content", "body", "text", "html", "paragraph", "rendered")
+                    for token in (
+                        "article",
+                        "content",
+                        "body",
+                        "text",
+                        "html",
+                        "paragraph",
+                        "rendered",
+                    )
                 ):
                     add_candidate(value)
                 walk(value)
@@ -127,9 +135,12 @@ def _extract_from_embedded_data(html: str) -> str:
 
     return max(candidates, key=len, default="")
 
+
 def _extract_from_dom(main_html: str) -> str:
     soup = BeautifulSoup(main_html, "html.parser")
-    for noise in soup.select("script, style, noscript, nav, footer, aside, form, iframe, header"):
+    for noise in soup.select(
+        "script, style, noscript, nav, footer, aside, form, iframe, header"
+    ):
         noise.decompose()
 
     for noise in soup.select(
@@ -198,14 +209,13 @@ def _extract_from_dom(main_html: str) -> str:
     return max(chunks, key=score, default="")
 
 
-
 def extract_url(text: str) -> str | None:
     if not text:
         return None
     match = _URL_RE.search(text)
     if not match:
         return None
-    candidate = match.group(0).rstrip(").,;:!?\"")
+    candidate = match.group(0).rstrip(').,;:!?"')
     parsed = urlparse(candidate)
     if parsed.scheme in {"http", "https"} and parsed.netloc:
         return candidate
@@ -258,7 +268,9 @@ async def fetch_article_content(url: str, timeout_seconds: int = 20) -> ArticleC
     else:
         body_text = text
 
-    full_text = f"{normalized_title}\n\n{body_text}".strip() if normalized_title else body_text
+    full_text = (
+        f"{normalized_title}\n\n{body_text}".strip() if normalized_title else body_text
+    )
 
     return ArticleContent(
         title=normalized_title,

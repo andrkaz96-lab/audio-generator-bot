@@ -6,11 +6,9 @@ _WHITESPACE_RE = re.compile(r"\s+")
 _SENTENCE_BOUNDARY_RE = re.compile(r"(?<=[.!?…])\s+")
 
 
-
 def normalize_text(value: str) -> str:
     normalized = _WHITESPACE_RE.sub(" ", value or "").strip()
     return normalized
-
 
 
 def split_text_into_chunks(text: str, max_chars: int) -> List[str]:

@@ -19,6 +19,7 @@ from .chunking import (
     HierarchicalTextChunker,
     normalize_tts_text,
 )
+from .speech_normalizer import speech_normalize
 
 
 logger = logging.getLogger(__name__)
@@ -189,7 +190,8 @@ class TTSPipeline:
         self._runtime_tracker = runtime_tracker or TTSRuntimeTracker()
 
     async def synthesize_to_file(self, text: str, destination: Path) -> list[Path]:
-        normalized_text = normalize_tts_text(text)
+        speech_ready = speech_normalize(text)
+        normalized_text = normalize_tts_text(speech_ready.text)
         deadline = time.monotonic() + self._config.overall_timeout_seconds
         job_started_at = time.monotonic()
         await self._progress("prepare_text", "Подготавливаю текст к озвучке...")
