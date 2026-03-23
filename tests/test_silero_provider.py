@@ -1,8 +1,12 @@
+import asyncio
+from pathlib import Path
+import tempfile
 import unittest
-from unittest.mock import patch
+from unittest.mock import AsyncMock, patch
 
 import numpy as np
 
+from botapp.tts.base import TTSProviderTimeoutError
 from botapp.tts.silero_provider import SileroTTSProvider
 
 
@@ -50,23 +54,74 @@ class _FakeEncoder:
         return b"z"
 
 
+class _FakeProcess:
+    def __init__(self) -> None:
+        self.pid = 123
+        self.returncode = None
+        self.killed = False
+        self.wait = AsyncMock(side_effect=self._wait)
+
+    async def communicate(self, _input: bytes):
+        await asyncio.sleep(10)
+        return b"", b""
+
+    def kill(self) -> None:
+        self.killed = True
+        self.returncode = -9
+
+    async def _wait(self) -> int:
+        self.returncode = -9
+        return -9
+
+
+class SileroProviderTests(unittest.IsolatedAsyncioTestCase):
+    async def test_synthesize_to_file_timeout_kills_worker(self):
+        provider = SileroTTSProvider()
+        process = _FakeProcess()
+
+        with (
+            tempfile.TemporaryDirectory() as tmpdir,
+            patch(
+                "botapp.tts.silero_provider.asyncio.create_subprocess_exec",
+                AsyncMock(return_value=process),
+            ),
+        ):
+            destination = Path(tmpdir) / "speech.mp3"
+            with self.assertRaises(TTSProviderTimeoutError):
+                await provider.synthesize_to_file(
+                    "очень длинный текст",
+                    destination,
+                    timeout_seconds=0,
+                )
+
+        self.assertTrue(process.killed)
+        process.wait.assert_awaited()
+        self.assertFalse(destination.exists())
+
+
 class SileroProviderMemoryTests(unittest.TestCase):
     def test_synthesize_stream_encodes_parts_without_numpy_concat(self):
         provider = SileroTTSProvider()
-        provider._model = _FakeModel()
         provider._max_chars_per_call = 10
 
         text = "Первое предложение. Второе предложение. Третье предложение."
         parts = provider._split_text(text, provider._max_chars_per_call)
 
         with (
+            tempfile.TemporaryDirectory() as tmpdir,
+            patch(
+                "botapp.tts.silero_provider._ensure_model_loaded",
+                return_value=_FakeModel(),
+            ),
             patch("botapp.tts.silero_provider.lameenc.Encoder", _FakeEncoder),
             patch(
                 "botapp.tts.silero_provider.np.concatenate",
                 side_effect=AssertionError("np.concatenate must not be called"),
             ),
         ):
-            audio = provider._synthesize_sync(text)
+            destination = Path(tmpdir) / "speech.mp3"
+            provider._synthesize_sync_to_file(text, destination)
+            audio = destination.read_bytes()
 
         expected_encode_calls = len(parts) + max(0, len(parts) - 1)
         self.assertEqual(audio, b"x" * expected_encode_calls + b"z")

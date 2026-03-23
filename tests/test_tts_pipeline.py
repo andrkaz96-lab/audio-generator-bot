@@ -4,21 +4,42 @@ import tempfile
 import unittest
 from unittest.mock import patch
 
+from botapp.runtime_metrics import TTSRuntimeTracker
+from botapp.tts.base import TTSProviderTimeoutError
 from botapp.tts.chunking import ChunkLimits, ChunkPlan, HierarchicalTextChunker
 from botapp.tts.pipeline import TTSProgressEvent, TTSPipeline, TTSPipelineConfig
 
 
-class _RecordingProvider:
-    def __init__(self, fail_above_chars: int | None = None) -> None:
+class _RecordingFileProvider:
+    def __init__(
+        self,
+        *,
+        fail_above_chars: int | None = None,
+        timeout_above_chars: int | None = None,
+    ) -> None:
         self.fail_above_chars = fail_above_chars
+        self.timeout_above_chars = timeout_above_chars
         self.calls: list[str] = []
+        self.timeout_calls: list[str] = []
 
-    async def synthesize(self, text: str) -> bytes:
+    async def synthesize_to_file(
+        self,
+        text: str,
+        destination: Path,
+        *,
+        timeout_seconds: int | None = None,
+    ) -> None:
         self.calls.append(text)
         await asyncio.sleep(0)
+        if (
+            self.timeout_above_chars is not None
+            and len(text) > self.timeout_above_chars
+        ):
+            self.timeout_calls.append(text)
+            raise TTSProviderTimeoutError("recording", timeout_seconds or 0)
         if self.fail_above_chars is not None and len(text) > self.fail_above_chars:
             raise RuntimeError(f"chunk too large: {len(text)}")
-        return f"<{len(text)}>".encode("utf-8")
+        destination.write_bytes(f"<{len(text)}>".encode("utf-8"))
 
 
 class ChunkingTests(unittest.TestCase):
@@ -93,7 +114,7 @@ class ChunkingTests(unittest.TestCase):
 
 class TTSPipelineTests(unittest.IsolatedAsyncioTestCase):
     async def test_pipeline_falls_back_to_smaller_chunks_after_failure(self):
-        provider = _RecordingProvider(fail_above_chars=80)
+        provider = _RecordingFileProvider(fail_above_chars=80)
         config = TTSPipelineConfig.from_limits(
             max_chars_per_chunk=120,
             max_sentences_per_chunk=3,
@@ -133,6 +154,66 @@ class TTSPipelineTests(unittest.IsolatedAsyncioTestCase):
                 any(event.stage.startswith("tts_chunk_") for event in progress)
             )
 
+    async def test_pipeline_uses_file_based_provider_api(self):
+        provider = _RecordingFileProvider()
+        config = TTSPipelineConfig.from_limits(
+            max_chars_per_chunk=80,
+            max_sentences_per_chunk=2,
+            max_words_per_chunk=20,
+            min_chars_per_chunk=20,
+            retry_count=0,
+            per_chunk_timeout_seconds=5,
+            overall_timeout_seconds=30,
+            temp_dir=None,
+            cleanup_temp_files=True,
+        )
+        pipeline = TTSPipeline(provider=provider, config=config)
+
+        with (
+            tempfile.TemporaryDirectory() as tmpdir,
+            patch("botapp.tts.pipeline.shutil.which", return_value=None),
+        ):
+            destination = Path(tmpdir) / "speech.mp3"
+            chunk_paths = await pipeline.synthesize_to_file(
+                "Короткий текст для синтеза.", destination
+            )
+
+            self.assertTrue(destination.exists())
+            self.assertGreater(destination.stat().st_size, 0)
+            self.assertEqual(len(chunk_paths), 1)
+
+    async def test_timeout_skips_same_size_retry_and_splits_immediately(self):
+        provider = _RecordingFileProvider(timeout_above_chars=80)
+        config = TTSPipelineConfig.from_limits(
+            max_chars_per_chunk=120,
+            max_sentences_per_chunk=3,
+            max_words_per_chunk=30,
+            min_chars_per_chunk=40,
+            retry_count=3,
+            per_chunk_timeout_seconds=1,
+            overall_timeout_seconds=30,
+            temp_dir=None,
+            cleanup_temp_files=True,
+        )
+        pipeline = TTSPipeline(provider=provider, config=config)
+        text = (
+            "Очень длинное предложение с несколькими частями, которое должно сначала словить таймаут, "
+            "а затем быть немедленно разбито на более короткие чанки без same-size retry."
+        )
+
+        with (
+            tempfile.TemporaryDirectory() as tmpdir,
+            patch("botapp.tts.pipeline.shutil.which", return_value=None),
+        ):
+            destination = Path(tmpdir) / "speech.mp3"
+            chunk_paths = await pipeline.synthesize_to_file(text, destination)
+
+            self.assertTrue(destination.exists())
+            self.assertGreater(len(chunk_paths), 1)
+            long_calls = [call for call in provider.calls if len(call) > 80]
+            self.assertEqual(len(long_calls), 1)
+            self.assertEqual(provider.timeout_calls, long_calls)
+
     async def test_pipeline_handles_stress_text_without_single_giant_chunk(self):
         sample = (
             "Каждый четвертый предприниматель совмещает работу ПВЗ с другим бизнесом в том же помещении. "
@@ -140,7 +221,7 @@ class TTSPipelineTests(unittest.IsolatedAsyncioTestCase):
             "его в ближайшее время."
         )
         text = " ".join([sample] * 500)
-        provider = _RecordingProvider()
+        provider = _RecordingFileProvider()
         config = TTSPipelineConfig.from_limits(
             max_chars_per_chunk=180,
             max_sentences_per_chunk=2,
@@ -157,6 +238,7 @@ class TTSPipelineTests(unittest.IsolatedAsyncioTestCase):
             provider=provider,
             config=config,
             progress_callback=lambda event: self._collect_progress(progress, event),
+            runtime_tracker=TTSRuntimeTracker(),
         )
 
         with (

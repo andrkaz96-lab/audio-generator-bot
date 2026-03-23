@@ -21,6 +21,7 @@ from aiogram.types import (
 
 from botapp.analytics import EventLogger
 from botapp.config import load_settings
+from botapp.runtime_metrics import TTSRuntimeTracker
 from botapp.extractors.input_resolver import resolve_input_text
 from botapp.extractors.article_pipeline import ArticleMode, run_article_pipeline
 from botapp.extractors.url_text import extract_url
@@ -66,6 +67,9 @@ llm_service = ArticleLLMService(
 
 dp = Dispatcher()
 T = TypeVar("T")
+runtime_tracker = TTSRuntimeTracker()
+_tts_job_semaphore = asyncio.Semaphore(max(1, settings.tts_max_concurrent_jobs))
+_tts_synth_semaphore = asyncio.Semaphore(max(1, settings.tts_max_concurrent_synths))
 MODE_CLOSE_TO_SOURCE = "close_to_source"
 MODE_AUDIO_ADAPTED = "audio_adapted"
 MODE_AUDIO_SUMMARY = "audio_summary"
@@ -229,21 +233,42 @@ def _make_tts_pipeline(
         temp_dir=settings.tts_temp_dir or None,
         cleanup_temp_files=settings.tts_cleanup_temp_files,
     )
+    synth_semaphore = None
+    if settings.local_tts_strict_mode or tts_provider.is_local:
+        synth_semaphore = _tts_synth_semaphore
     return TTSPipeline(
         provider=tts_provider,
         config=config,
         progress_callback=progress_callback,
-        timeout_runner=lambda operation, timeout_seconds, stage: _run_with_timeout(
-            operation,
-            timeout_seconds=timeout_seconds,
-            step=stage,
-        ),
+        synth_semaphore=synth_semaphore,
+        runtime_tracker=runtime_tracker,
     )
 
 
 def _distinct_id(message: Message) -> str:
     user_id = message.from_user.id if message.from_user else 0
     return str(user_id)
+
+
+async def _acquire_tts_job_slot(
+    status_message: Message | None,
+    message: Message,
+) -> Message | None:
+    if _tts_job_semaphore.locked():
+        status_message = await safe_update_status(
+            status_message=status_message,
+            text=(
+                "Ожидаю свободный слот TTS на сервере... "
+                f"Активных задач: {runtime_tracker.active_jobs}."
+            ),
+            fallback_message_source=message,
+        )
+    await _tts_job_semaphore.acquire()
+    return status_message
+
+
+def _release_tts_job_slot() -> None:
+    _tts_job_semaphore.release()
 
 
 def _source_from_start(text: str | None) -> str | None:
@@ -399,230 +424,243 @@ async def _generate_and_send_audio(
     url_mode: ArticleMode = MODE_CLOSE_TO_SOURCE,
 ) -> None:
     started_at = time.perf_counter()
+    status_message = await _acquire_tts_job_slot(status_message, message)
     try:
-        maybe_url = extract_url(raw_text or "")
-        if maybe_url and pdf_path is None:
-            extraction_started_at = time.monotonic()
+        async with runtime_tracker.track_job():
             logger.info(
-                "link pipeline extraction start: url=%s mode=%s", maybe_url, url_mode
+                "tts job started: active_jobs=%s active_synths=%s",
+                runtime_tracker.active_jobs,
+                runtime_tracker.active_synths,
             )
-            pipeline_result = await run_article_pipeline(
-                url=maybe_url,
-                mode=url_mode,
-                timeout_seconds=settings.request_timeout_seconds,
-                llm_service=llm_service,
-            )
-            logger.info(
-                "link pipeline extraction completed: url=%s mode=%s chars=%s duration_sec=%.3f",
-                maybe_url,
-                url_mode,
-                len(pipeline_result.text),
-                time.monotonic() - extraction_started_at,
-            )
-            text, input_was_truncated = _prepare_tts_input(pipeline_result.text)
-            resolved_source = "url"
-            await event_logger.capture(
-                event="url_pipeline_completed",
-                distinct_id=_distinct_id(message),
-                properties={
-                    "mode": pipeline_result.mode,
-                    "quality_score": pipeline_result.quality_report.quality_score,
-                    "decision": pipeline_result.quality_report.decision,
-                    "llm_used": pipeline_result.processing_trace.llm_used,
-                    "flags": ",".join(pipeline_result.quality_report.flags),
-                    "warnings": ",".join(pipeline_result.warnings),
-                    "tts_input_truncated": input_was_truncated,
-                },
-            )
-        else:
-            extraction_started_at = time.monotonic()
-            logger.info("input resolve start: has_pdf=%s", bool(pdf_path))
-            resolved = await resolve_input_text(
-                raw_text=raw_text,
-                pdf_local_path=pdf_path,
-                timeout_seconds=settings.request_timeout_seconds,
-            )
-            logger.info(
-                "input resolve completed: source=%s chars=%s duration_sec=%.3f",
-                resolved.source,
-                len(resolved.text),
-                time.monotonic() - extraction_started_at,
-            )
-            text, input_was_truncated = _prepare_tts_input(resolved.text)
-            resolved_source = resolved.source
-
-        if not text:
-            status_message = await safe_update_status(
-                status_message=status_message,
-                text="Не удалось извлечь текст. Пришли другой источник.",
-                fallback_message_source=message,
-            )
-            await event_logger.capture(
-                event="error_occurred",
-                distinct_id=_distinct_id(message),
-                properties={
-                    "error_type": "EmptyResolvedText",
-                    "step": "extract_text",
-                    "source": resolved_source,
-                },
-            )
-            return
-
-        if resolved_source == "url":
-            status_message = await safe_update_status(
-                status_message=status_message,
-                text="Отправляю текст статьи перед синтезом...",
-                fallback_message_source=message,
-            )
-            with tempfile.TemporaryDirectory() as tmpdir:
-                article_text_path = Path(tmpdir) / "article_tts_input.txt"
-                article_text_path.write_text(text, encoding="utf-8")
-                await with_telegram_retries(
-                    lambda: message.answer_document(
-                        document=FSInputFile(article_text_path),
-                        caption="Текст, который отправляю в синтез.",
-                    ),
-                    retries=settings.telegram_api_retries,
+            maybe_url = extract_url(raw_text or "")
+            if maybe_url and pdf_path is None:
+                extraction_started_at = time.monotonic()
+                logger.info(
+                    "link pipeline extraction start: url=%s mode=%s",
+                    maybe_url,
+                    url_mode,
                 )
+                pipeline_result = await run_article_pipeline(
+                    url=maybe_url,
+                    mode=url_mode,
+                    timeout_seconds=settings.request_timeout_seconds,
+                    llm_service=llm_service,
+                )
+                logger.info(
+                    "link pipeline extraction completed: url=%s mode=%s chars=%s duration_sec=%.3f",
+                    maybe_url,
+                    url_mode,
+                    len(pipeline_result.text),
+                    time.monotonic() - extraction_started_at,
+                )
+                text, input_was_truncated = _prepare_tts_input(pipeline_result.text)
+                resolved_source = "url"
+                await event_logger.capture(
+                    event="url_pipeline_completed",
+                    distinct_id=_distinct_id(message),
+                    properties={
+                        "mode": pipeline_result.mode,
+                        "quality_score": pipeline_result.quality_report.quality_score,
+                        "decision": pipeline_result.quality_report.decision,
+                        "llm_used": pipeline_result.processing_trace.llm_used,
+                        "flags": ",".join(pipeline_result.quality_report.flags),
+                        "warnings": ",".join(pipeline_result.warnings),
+                        "tts_input_truncated": input_was_truncated,
+                    },
+                )
+            else:
+                extraction_started_at = time.monotonic()
+                logger.info("input resolve start: has_pdf=%s", bool(pdf_path))
+                resolved = await resolve_input_text(
+                    raw_text=raw_text,
+                    pdf_local_path=pdf_path,
+                    timeout_seconds=settings.request_timeout_seconds,
+                )
+                logger.info(
+                    "input resolve completed: source=%s chars=%s duration_sec=%.3f",
+                    resolved.source,
+                    len(resolved.text),
+                    time.monotonic() - extraction_started_at,
+                )
+                text, input_was_truncated = _prepare_tts_input(resolved.text)
+                resolved_source = resolved.source
 
-        await event_logger.capture(
-            event="audio_generation_started",
-            distinct_id=_distinct_id(message),
-            properties={
-                "char_count": len(text),
-                "source": resolved_source,
-                "tts_input_truncated": input_was_truncated,
-            },
-        )
-
-        with tempfile.TemporaryDirectory() as tmpdir:
-            out_path = Path(tmpdir) / "speech.mp3"
-
-            async def _on_tts_progress(event: TTSProgressEvent) -> None:
-                nonlocal status_message
+            if not text:
                 status_message = await safe_update_status(
                     status_message=status_message,
-                    text=event.message,
-                    fallback_message_source=message,
-                )
-
-            pipeline = _make_tts_pipeline(progress_callback=_on_tts_progress)
-
-            logger.info(
-                "tts pipeline start: source=%s text_chars=%s chunk_char_limit=%s sentence_limit=%s word_limit=%s",
-                resolved_source,
-                len(text),
-                settings.max_chars_per_chunk,
-                settings.max_sentences_per_chunk,
-                settings.max_words_per_chunk,
-            )
-            try:
-                chunk_paths = await pipeline.synthesize_to_file(text, out_path)
-            except ValueError:
-                status_message = await safe_update_status(
-                    status_message=status_message,
-                    text="Текст пустой после обработки.",
+                    text="Не удалось извлечь текст. Пришли другой источник.",
                     fallback_message_source=message,
                 )
                 await event_logger.capture(
                     event="error_occurred",
                     distinct_id=_distinct_id(message),
                     properties={
-                        "error_type": "EmptyChunks",
-                        "step": "split_text",
+                        "error_type": "EmptyResolvedText",
+                        "step": "extract_text",
                         "source": resolved_source,
                     },
                 )
                 return
-            output_size = out_path.stat().st_size
-            logger.info(
-                "tts completed: chunks=%s output_bytes=%s",
-                len(chunk_paths),
-                output_size,
-            )
-            logger.info(
-                "audio merge completed: chunks=%s output_bytes=%s",
-                len(chunk_paths),
-                output_size,
-            )
-            status_message = await safe_update_status(
-                status_message=status_message,
-                text="Отправляю аудио в Telegram...",
-                fallback_message_source=message,
-            )
-            logger.info(
-                "tts pipeline progress: stage=send_audio source=%s", resolved_source
-            )
-            logger.info(
-                "telegram send audio start: output_bytes=%s source=%s",
-                output_size,
-                resolved_source,
-            )
-            try:
-                await with_telegram_retries(
-                    lambda: _run_with_timeout(
-                        message.answer_audio(
-                            audio=FSInputFile(out_path),
-                            caption=(
-                                "Готово. Источник: "
-                                f"{resolved_source}. Длина текста: {len(text)} символов."
-                            ),
-                        ),
-                        timeout_seconds=settings.telegram_api_timeout_seconds,
-                        step="send_audio",
-                    ),
-                    retries=settings.telegram_api_retries,
-                )
-            except Exception:
-                logger.exception(
-                    "telegram send audio failed: output_bytes=%s source=%s",
-                    output_size,
-                    resolved_source,
-                )
-                raise
-            logger.info("telegram send audio completed: output_bytes=%s", output_size)
-        processing_time = round(time.perf_counter() - started_at, 3)
 
-        await event_logger.capture(
-            event="audio_generated",
-            distinct_id=_distinct_id(message),
-            properties={
-                "duration_sec": 0,
-                "char_count": len(text),
-                "processing_time_sec": processing_time,
-                "source": resolved_source,
-            },
-        )
-        if resolved_source == "url":
+            if resolved_source == "url":
+                status_message = await safe_update_status(
+                    status_message=status_message,
+                    text="Отправляю текст статьи перед синтезом...",
+                    fallback_message_source=message,
+                )
+                with tempfile.TemporaryDirectory() as tmpdir:
+                    article_text_path = Path(tmpdir) / "article_tts_input.txt"
+                    article_text_path.write_text(text, encoding="utf-8")
+                    await with_telegram_retries(
+                        lambda: message.answer_document(
+                            document=FSInputFile(article_text_path),
+                            caption="Текст, который отправляю в синтез.",
+                        ),
+                        retries=settings.telegram_api_retries,
+                    )
+
             await event_logger.capture(
-                event="llm output_sent_to_tts",
+                event="audio_generation_started",
                 distinct_id=_distinct_id(message),
                 properties={
-                    "flow": "article_to_tts",
-                    "source_type": "url",
                     "char_count": len(text),
+                    "source": resolved_source,
+                    "tts_input_truncated": input_was_truncated,
+                    "active_jobs": runtime_tracker.active_jobs,
+                    "active_synths": runtime_tracker.active_synths,
                 },
             )
 
-        await event_logger.capture(
-            event="audio_downloaded",
-            distinct_id=_distinct_id(message),
-            properties={"source": resolved_source},
-        )
+            with tempfile.TemporaryDirectory() as tmpdir:
+                out_path = Path(tmpdir) / "speech.mp3"
 
-        if status_message:
-            await with_telegram_retries(
-                lambda: status_message.delete(),
-                retries=settings.telegram_api_retries,
+                async def _on_tts_progress(event: TTSProgressEvent) -> None:
+                    nonlocal status_message
+                    status_message = await safe_update_status(
+                        status_message=status_message,
+                        text=event.message,
+                        fallback_message_source=message,
+                    )
+
+                pipeline = _make_tts_pipeline(progress_callback=_on_tts_progress)
+
+                logger.info(
+                    "tts pipeline start: source=%s text_chars=%s chunk_char_limit=%s sentence_limit=%s word_limit=%s active_jobs=%s active_synths=%s",
+                    resolved_source,
+                    len(text),
+                    settings.max_chars_per_chunk,
+                    settings.max_sentences_per_chunk,
+                    settings.max_words_per_chunk,
+                    runtime_tracker.active_jobs,
+                    runtime_tracker.active_synths,
+                )
+                try:
+                    chunk_paths = await pipeline.synthesize_to_file(text, out_path)
+                except ValueError:
+                    status_message = await safe_update_status(
+                        status_message=status_message,
+                        text="Текст пустой после обработки.",
+                        fallback_message_source=message,
+                    )
+                    await event_logger.capture(
+                        event="error_occurred",
+                        distinct_id=_distinct_id(message),
+                        properties={
+                            "error_type": "EmptyChunks",
+                            "step": "split_text",
+                            "source": resolved_source,
+                        },
+                    )
+                    return
+                output_size = out_path.stat().st_size
+                logger.info(
+                    "tts completed: chunks=%s output_bytes=%s active_jobs=%s active_synths=%s",
+                    len(chunk_paths),
+                    output_size,
+                    runtime_tracker.active_jobs,
+                    runtime_tracker.active_synths,
+                )
+                status_message = await safe_update_status(
+                    status_message=status_message,
+                    text="Отправляю аудио в Telegram...",
+                    fallback_message_source=message,
+                )
+                logger.info(
+                    "telegram send audio start: output_bytes=%s source=%s",
+                    output_size,
+                    resolved_source,
+                )
+                try:
+                    await with_telegram_retries(
+                        lambda: _run_with_timeout(
+                            message.answer_audio(
+                                audio=FSInputFile(out_path),
+                                caption=(
+                                    "Готово. Источник: "
+                                    f"{resolved_source}. Длина текста: {len(text)} символов."
+                                ),
+                            ),
+                            timeout_seconds=settings.telegram_api_timeout_seconds,
+                            step="send_audio",
+                        ),
+                        retries=settings.telegram_api_retries,
+                    )
+                except Exception:
+                    logger.exception(
+                        "telegram send audio failed: output_bytes=%s source=%s",
+                        output_size,
+                        resolved_source,
+                    )
+                    raise
+                logger.info(
+                    "telegram send audio completed: output_bytes=%s",
+                    output_size,
+                )
+            processing_time = round(time.perf_counter() - started_at, 3)
+
+            await event_logger.capture(
+                event="audio_generated",
+                distinct_id=_distinct_id(message),
+                properties={
+                    "duration_sec": 0,
+                    "char_count": len(text),
+                    "processing_time_sec": processing_time,
+                    "source": resolved_source,
+                    "active_jobs": runtime_tracker.active_jobs,
+                    "active_synths": runtime_tracker.active_synths,
+                },
             )
-        logger.info(
-            "pipeline completed successfully: source=%s chars=%s chunks=%s duration_sec=%.3f",
-            resolved_source,
-            len(text),
-            len(chunk_paths),
-            time.perf_counter() - started_at,
-        )
+            if resolved_source == "url":
+                await event_logger.capture(
+                    event="llm output_sent_to_tts",
+                    distinct_id=_distinct_id(message),
+                    properties={
+                        "flow": "article_to_tts",
+                        "source_type": "url",
+                        "char_count": len(text),
+                    },
+                )
 
+            await event_logger.capture(
+                event="audio_downloaded",
+                distinct_id=_distinct_id(message),
+                properties={"source": resolved_source},
+            )
+
+            if status_message:
+                await with_telegram_retries(
+                    lambda: status_message.delete(),
+                    retries=settings.telegram_api_retries,
+                )
+            logger.info(
+                "pipeline completed successfully: source=%s chars=%s chunks=%s duration_sec=%.3f active_jobs=%s active_synths=%s",
+                resolved_source,
+                len(text),
+                len(chunk_paths),
+                time.perf_counter() - started_at,
+                runtime_tracker.active_jobs,
+                runtime_tracker.active_synths,
+            )
     except Exception as exc:
         logger.exception("Failed to generate audio")
         error_text = (
@@ -637,6 +675,8 @@ async def _generate_and_send_audio(
                 "error_type": type(exc).__name__,
                 "error_message": str(exc),
                 "step": getattr(exc, "step", "pipeline"),
+                "active_jobs": runtime_tracker.active_jobs,
+                "active_synths": runtime_tracker.active_synths,
             },
         )
         await safe_update_status(
@@ -644,6 +684,8 @@ async def _generate_and_send_audio(
             text=error_text,
             fallback_message_source=message,
         )
+    finally:
+        _release_tts_job_slot()
 
 
 async def main() -> None:

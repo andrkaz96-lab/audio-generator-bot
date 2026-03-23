@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from pathlib import Path
+
 from .base import TTSProvider
 
 
@@ -10,5 +12,12 @@ class YandexSpeechKitProvider(TTSProvider):
             "Use TTS_PROVIDER=edge for local run, then add cloud creds and implementation."
         )
 
-    async def synthesize(self, text: str) -> bytes:
+    async def synthesize_to_file(
+        self,
+        text: str,
+        destination: Path,
+        *,
+        timeout_seconds: int | None = None,
+    ) -> None:
+        _ = text, destination, timeout_seconds
         raise NotImplementedError
