@@ -26,17 +26,20 @@ class Settings:
         Path.home() / ".cache" / "audio-generator-bot" / "silero-models"
     )
     silero_allow_download_on_startup: bool = True
-    max_chars_per_chunk: int = 220
-    max_sentences_per_chunk: int = 3
-    max_words_per_chunk: int = 60
-    min_chars_per_chunk: int = 80
+    max_chars_per_chunk: int = 160
+    max_sentences_per_chunk: int = 2
+    max_words_per_chunk: int = 35
+    min_chars_per_chunk: int = 60
     max_input_chars: int = 0
     request_timeout_seconds: int = 20
     telegram_api_timeout_seconds: int = 120
     telegram_api_retries: int = 3
     tts_chunk_timeout_seconds: int = 45
     tts_overall_timeout_seconds: int = 900
-    tts_chunk_retry_count: int = 1
+    tts_chunk_retry_count: int = 0
+    tts_max_concurrent_jobs: int = 1
+    tts_max_concurrent_synths: int = 1
+    local_tts_strict_mode: bool = True
     tts_temp_dir: str = ""
     tts_cleanup_temp_files: bool = True
     posthog_api_key: str = ""
@@ -76,10 +79,10 @@ def load_settings() -> Settings:
         silero_allow_download_on_startup=_as_bool(
             "SILERO_ALLOW_DOWNLOAD_ON_STARTUP", "true"
         ),
-        max_chars_per_chunk=int(os.getenv("MAX_CHARS_PER_CHUNK", "220")),
-        max_sentences_per_chunk=int(os.getenv("MAX_SENTENCES_PER_CHUNK", "3")),
-        max_words_per_chunk=int(os.getenv("MAX_WORDS_PER_CHUNK", "60")),
-        min_chars_per_chunk=int(os.getenv("MIN_CHARS_PER_CHUNK", "80")),
+        max_chars_per_chunk=int(os.getenv("MAX_CHARS_PER_CHUNK", "160")),
+        max_sentences_per_chunk=int(os.getenv("MAX_SENTENCES_PER_CHUNK", "2")),
+        max_words_per_chunk=int(os.getenv("MAX_WORDS_PER_CHUNK", "35")),
+        min_chars_per_chunk=int(os.getenv("MIN_CHARS_PER_CHUNK", "60")),
         max_input_chars=int(os.getenv("MAX_INPUT_CHARS", "0")),
         request_timeout_seconds=int(os.getenv("REQUEST_TIMEOUT_SECONDS", "20")),
         telegram_api_timeout_seconds=int(
@@ -90,7 +93,10 @@ def load_settings() -> Settings:
         tts_overall_timeout_seconds=int(
             os.getenv("TTS_OVERALL_TIMEOUT_SECONDS", "900")
         ),
-        tts_chunk_retry_count=int(os.getenv("TTS_CHUNK_RETRY_COUNT", "1")),
+        tts_chunk_retry_count=int(os.getenv("TTS_CHUNK_RETRY_COUNT", "0")),
+        tts_max_concurrent_jobs=int(os.getenv("TTS_MAX_CONCURRENT_JOBS", "1")),
+        tts_max_concurrent_synths=int(os.getenv("TTS_MAX_CONCURRENT_SYNTHS", "1")),
+        local_tts_strict_mode=_as_bool("LOCAL_TTS_STRICT_MODE", "true"),
         tts_temp_dir=os.getenv("TTS_TEMP_DIR", "").strip(),
         tts_cleanup_temp_files=_as_bool("TTS_CLEANUP_TEMP_FILES", "true"),
         posthog_api_key=os.getenv("POSTHOG_API_KEY", "").strip(),

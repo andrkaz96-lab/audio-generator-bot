@@ -10,7 +10,6 @@ from .silero_provider import SileroTTSProvider
 from .yandex_provider import YandexSpeechKitProvider
 
 
-
 def make_tts_provider(settings: Settings) -> TTSProvider:
     if settings.tts_provider == "silero":
         primary = SileroTTSProvider(

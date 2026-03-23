@@ -1,6 +1,7 @@
 import asyncio
 import importlib
 import os
+from pathlib import Path
 import sys
 import unittest
 from unittest.mock import AsyncMock, patch
@@ -46,11 +47,15 @@ class MainTimeoutTests(unittest.IsolatedAsyncioTestCase):
         status_message = AsyncMock()
         status_message.text = "Старт"
         status_message.message_id = 1
-        status_message.edit_text = AsyncMock(
-            side_effect=self.main.ProcessingTimeoutError(
-                step="tts chunk 1/1", timeout_seconds=1
-            )
-        )
+
+        provider = type(
+            "Provider",
+            (),
+            {
+                "is_local": True,
+                "synthesize_to_file": AsyncMock(side_effect=asyncio.TimeoutError()),
+            },
+        )()
 
         with (
             patch.object(self.main, "extract_url", return_value=None),
@@ -67,13 +72,20 @@ class MainTimeoutTests(unittest.IsolatedAsyncioTestCase):
                 self.main, "safe_update_status", AsyncMock(return_value=status_message)
             ) as safe_update_status,
             patch.object(self.main, "event_logger") as event_logger,
+            patch.object(self.main, "tts_provider", provider),
             patch.object(
                 self.main,
-                "tts_provider",
-                type(
-                    "Provider",
+                "_make_tts_pipeline",
+                return_value=type(
+                    "Pipeline",
                     (),
-                    {"synthesize": AsyncMock(side_effect=asyncio.TimeoutError())},
+                    {
+                        "synthesize_to_file": AsyncMock(
+                            side_effect=self.main.ProcessingTimeoutError(
+                                step="tts chunk 1/1", timeout_seconds=1
+                            )
+                        )
+                    },
                 )(),
             ),
         ):
@@ -85,7 +97,7 @@ class MainTimeoutTests(unittest.IsolatedAsyncioTestCase):
                 pdf_path=None,
             )
 
-        self.assertGreaterEqual(safe_update_status.await_count, 2)
+        self.assertGreaterEqual(safe_update_status.await_count, 1)
         final_call = safe_update_status.await_args_list[-1]
         self.assertIn("операция зависла", final_call.kwargs["text"])
         self.assertIn("tts chunk 1/1", final_call.kwargs["text"])
@@ -100,7 +112,7 @@ class MainTimeoutTests(unittest.IsolatedAsyncioTestCase):
 
     def test_resolve_tts_chunk_size_uses_safe_default_for_short_texts(self):
         chunk_size = self.main._resolve_tts_chunk_size("А" * 286)
-        self.assertEqual(chunk_size, 220)
+        self.assertEqual(chunk_size, 160)
 
     async def test_generate_and_send_audio_processes_text_longer_than_old_limit(self):
         long_text = " ".join(["Предложение."] * 7000)
@@ -116,7 +128,13 @@ class MainTimeoutTests(unittest.IsolatedAsyncioTestCase):
         status_message.message_id = 1
         status_message.delete = AsyncMock()
 
-        synthesize = AsyncMock(return_value=b"x")
+        observed_texts: list[str] = []
+
+        class Pipeline:
+            async def synthesize_to_file(self, text: str, destination: Path):
+                observed_texts.append(text)
+                destination.write_bytes(b"x")
+                return [destination]
 
         with (
             patch.object(self.main, "extract_url", return_value=None),
@@ -133,11 +151,7 @@ class MainTimeoutTests(unittest.IsolatedAsyncioTestCase):
                 self.main, "safe_update_status", AsyncMock(return_value=status_message)
             ),
             patch.object(self.main, "event_logger") as event_logger,
-            patch.object(
-                self.main,
-                "tts_provider",
-                type("Provider", (), {"synthesize": synthesize})(),
-            ),
+            patch.object(self.main, "_make_tts_pipeline", return_value=Pipeline()),
         ):
             event_logger.capture = AsyncMock()
             await self.main._generate_and_send_audio(
@@ -147,15 +161,13 @@ class MainTimeoutTests(unittest.IsolatedAsyncioTestCase):
                 pdf_path=None,
             )
 
-        synthesized_text = " ".join(call.args[0] for call in synthesize.await_args_list)
+        synthesized_text = " ".join(observed_texts)
         synthesized_text = " ".join(synthesized_text.split()).strip()
         self.assertEqual(synthesized_text, normalized_text)
         self.assertGreater(len(normalized_text), 60000)
         message.answer_audio.assert_awaited_once()
 
-    async def test_generate_and_send_audio_splits_text_longer_than_220_chars(self):
-        text = " ".join(["Короткое предложение."] * 12)
-
+    async def test_generate_and_send_audio_waits_for_job_slot(self):
         message = AsyncMock()
         message.chat.id = 123
         message.from_user.id = 456
@@ -166,42 +178,56 @@ class MainTimeoutTests(unittest.IsolatedAsyncioTestCase):
         status_message.message_id = 1
         status_message.delete = AsyncMock()
 
-        synthesize = AsyncMock(return_value=b"x")
+        original_semaphore = self.main._tts_job_semaphore
+        self.main._tts_job_semaphore = asyncio.Semaphore(1)
+        await self.main._tts_job_semaphore.acquire()
 
-        with (
-            patch.object(self.main, "extract_url", return_value=None),
-            patch.object(
-                self.main,
-                "resolve_input_text",
-                AsyncMock(
-                    return_value=type(
-                        "Resolved", (), {"text": text, "source": "text"}
-                    )()
+        class Pipeline:
+            async def synthesize_to_file(self, text: str, destination: Path):
+                destination.write_bytes(b"x")
+                return [destination]
+
+        try:
+            with (
+                patch.object(self.main, "extract_url", return_value=None),
+                patch.object(
+                    self.main,
+                    "resolve_input_text",
+                    AsyncMock(
+                        return_value=type(
+                            "Resolved", (), {"text": "Текст", "source": "text"}
+                        )()
+                    ),
                 ),
-            ),
-            patch.object(
-                self.main, "safe_update_status", AsyncMock(return_value=status_message)
-            ),
-            patch.object(self.main, "event_logger") as event_logger,
-            patch.object(
-                self.main,
-                "tts_provider",
-                type("Provider", (), {"synthesize": synthesize})(),
-            ),
-        ):
-            event_logger.capture = AsyncMock()
-            await self.main._generate_and_send_audio(
-                message=message,
-                status_message=status_message,
-                raw_text=text,
-                pdf_path=None,
-            )
-
-        self.assertGreater(len(text), 220)
-        self.assertGreater(len(synthesize.await_args_list), 1)
-        self.assertTrue(
-            all(len(call.args[0]) <= 220 for call in synthesize.await_args_list)
-        )
+                patch.object(
+                    self.main,
+                    "safe_update_status",
+                    AsyncMock(return_value=status_message),
+                ) as safe_update_status,
+                patch.object(self.main, "event_logger") as event_logger,
+                patch.object(self.main, "_make_tts_pipeline", return_value=Pipeline()),
+            ):
+                event_logger.capture = AsyncMock()
+                task = asyncio.create_task(
+                    self.main._generate_and_send_audio(
+                        message=message,
+                        status_message=status_message,
+                        raw_text="Текст",
+                        pdf_path=None,
+                    )
+                )
+                await asyncio.sleep(0.05)
+                self.assertTrue(task and not task.done())
+                waiting_texts = [
+                    call.kwargs["text"] for call in safe_update_status.await_args_list
+                ]
+                self.assertTrue(
+                    any("Ожидаю свободный слот TTS" in text for text in waiting_texts)
+                )
+                self.main._tts_job_semaphore.release()
+                await task
+        finally:
+            self.main._tts_job_semaphore = original_semaphore
 
 
 if __name__ == "__main__":
