@@ -9,10 +9,14 @@ from botapp.llm.service import ArticleLLMService, ArticleTTSResult
 
 class ConfigTests(unittest.TestCase):
     def test_env_priority_for_folder_id(self):
-        with patch.dict(os.environ, {
-            "TELEGRAM_BOT_TOKEN": "1:abc",
-            "YANDEX_FOLDER_ID": "env-folder",
-        }, clear=False):
+        with patch.dict(
+            os.environ,
+            {
+                "TELEGRAM_BOT_TOKEN": "1:abc",
+                "YANDEX_FOLDER_ID": "env-folder",
+            },
+            clear=False,
+        ):
             settings = load_settings()
             self.assertEqual(settings.yandex_folder_id, "env-folder")
 

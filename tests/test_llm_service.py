@@ -235,6 +235,10 @@ class PromptTests(unittest.TestCase):
     def test_mode_prompts_reflect_new_policy(self):
         self.assertIn("НЕ summary", SYSTEM_PROMPT_AUDIO_ADAPTED)
         self.assertIn("умеренное сокращение", SYSTEM_PROMPT_AUDIO_SUMMARY)
+        self.assertIn(
+            "Нельзя молча удалять значимые токены", SYSTEM_PROMPT_AUDIO_ADAPTED
+        )
+        self.assertIn("Few-shot ориентиры verbalization", SYSTEM_PROMPT_AUDIO_SUMMARY)
         self.assertNotIn("3 минут", SYSTEM_PROMPT_AUDIO_ADAPTED)
 
 

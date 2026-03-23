@@ -6,11 +6,15 @@ from unittest.mock import patch
 
 from botapp.runtime_metrics import TTSRuntimeTracker
 from botapp.tts.base import TTSProviderTimeoutError
+from botapp.tts.fallback_provider import FallbackTTSProvider
 from botapp.tts.chunking import ChunkLimits, ChunkPlan, HierarchicalTextChunker
 from botapp.tts.pipeline import TTSProgressEvent, TTSPipeline, TTSPipelineConfig
 
 
 class _RecordingFileProvider:
+    provider_name = "recording"
+    is_local = False
+
     def __init__(
         self,
         *,
@@ -21,6 +25,12 @@ class _RecordingFileProvider:
         self.timeout_above_chars = timeout_above_chars
         self.calls: list[str] = []
         self.timeout_calls: list[str] = []
+
+    async def preload(self) -> None:
+        return None
+
+    async def reset(self) -> None:
+        return None
 
     async def synthesize_to_file(
         self,
@@ -213,6 +223,73 @@ class TTSPipelineTests(unittest.IsolatedAsyncioTestCase):
             long_calls = [call for call in provider.calls if len(call) > 80]
             self.assertEqual(len(long_calls), 1)
             self.assertEqual(provider.timeout_calls, long_calls)
+
+    async def test_pipeline_normalizes_speech_sensitive_tokens_before_synth(self):
+        provider = _RecordingFileProvider()
+        config = TTSPipelineConfig.from_limits(
+            max_chars_per_chunk=400,
+            max_sentences_per_chunk=4,
+            max_words_per_chunk=80,
+            min_chars_per_chunk=40,
+            retry_count=0,
+            per_chunk_timeout_seconds=5,
+            overall_timeout_seconds=30,
+            temp_dir=None,
+            cleanup_temp_files=True,
+        )
+        pipeline = TTSPipeline(provider=provider, config=config)
+        text = (
+            "В 2025 году OpenAI показала рост на 12.5%. "
+            "Температура выросла до 12°C, скорость — 5 км/ч. "
+            "Версия GPT-4.1 доступна через API."
+        )
+
+        with (
+            tempfile.TemporaryDirectory() as tmpdir,
+            patch("botapp.tts.pipeline.shutil.which", return_value=None),
+        ):
+            destination = Path(tmpdir) / "normalized.mp3"
+            await pipeline.synthesize_to_file(text, destination)
+
+        joined = " ".join(provider.calls)
+        self.assertIn("две тысячи двадцать пять", joined)
+        self.assertIn("оупен эй ай", joined)
+        self.assertIn("двенадцать целых пять десятых процента", joined)
+        self.assertIn("двенадцать градусов Цельсия", joined)
+        self.assertIn("пять километров в час", joined)
+        self.assertIn("джи пи ти четыре целых одна десятая", joined)
+        self.assertIn("эй пи ай", joined)
+
+    async def test_fallback_path_receives_normalized_text(self):
+        primary = _RecordingFileProvider(fail_above_chars=1)
+        fallback = _RecordingFileProvider()
+        provider = FallbackTTSProvider(primary=primary, fallback=fallback)
+        config = TTSPipelineConfig.from_limits(
+            max_chars_per_chunk=400,
+            max_sentences_per_chunk=4,
+            max_words_per_chunk=80,
+            min_chars_per_chunk=40,
+            retry_count=0,
+            per_chunk_timeout_seconds=5,
+            overall_timeout_seconds=30,
+            temp_dir=None,
+            cleanup_temp_files=True,
+        )
+        pipeline = TTSPipeline(provider=provider, config=config)
+
+        with (
+            tempfile.TemporaryDirectory() as tmpdir,
+            patch("botapp.tts.pipeline.shutil.which", return_value=None),
+        ):
+            destination = Path(tmpdir) / "fallback.mp3"
+            await pipeline.synthesize_to_file(
+                "Используется Wi‑Fi 6 и USB-C.", destination
+            )
+
+        self.assertTrue(primary.calls)
+        self.assertTrue(fallback.calls)
+        self.assertIn("вай фай шесть", fallback.calls[0])
+        self.assertIn("ю эс би си", fallback.calls[0])
 
     async def test_pipeline_handles_stress_text_without_single_giant_chunk(self):
         sample = (
