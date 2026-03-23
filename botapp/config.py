@@ -27,11 +27,18 @@ class Settings:
     )
     silero_allow_download_on_startup: bool = True
     max_chars_per_chunk: int = 220
+    max_sentences_per_chunk: int = 3
+    max_words_per_chunk: int = 60
+    min_chars_per_chunk: int = 80
     max_input_chars: int = 0
     request_timeout_seconds: int = 20
     telegram_api_timeout_seconds: int = 120
     telegram_api_retries: int = 3
     tts_chunk_timeout_seconds: int = 45
+    tts_overall_timeout_seconds: int = 900
+    tts_chunk_retry_count: int = 1
+    tts_temp_dir: str = ""
+    tts_cleanup_temp_files: bool = True
     posthog_api_key: str = ""
     posthog_project_id: str = ""
     posthog_host: str = "https://app.posthog.com"
@@ -70,6 +77,9 @@ def load_settings() -> Settings:
             "SILERO_ALLOW_DOWNLOAD_ON_STARTUP", "true"
         ),
         max_chars_per_chunk=int(os.getenv("MAX_CHARS_PER_CHUNK", "220")),
+        max_sentences_per_chunk=int(os.getenv("MAX_SENTENCES_PER_CHUNK", "3")),
+        max_words_per_chunk=int(os.getenv("MAX_WORDS_PER_CHUNK", "60")),
+        min_chars_per_chunk=int(os.getenv("MIN_CHARS_PER_CHUNK", "80")),
         max_input_chars=int(os.getenv("MAX_INPUT_CHARS", "0")),
         request_timeout_seconds=int(os.getenv("REQUEST_TIMEOUT_SECONDS", "20")),
         telegram_api_timeout_seconds=int(
@@ -77,6 +87,12 @@ def load_settings() -> Settings:
         ),
         telegram_api_retries=int(os.getenv("TELEGRAM_API_RETRIES", "3")),
         tts_chunk_timeout_seconds=int(os.getenv("TTS_CHUNK_TIMEOUT_SECONDS", "45")),
+        tts_overall_timeout_seconds=int(
+            os.getenv("TTS_OVERALL_TIMEOUT_SECONDS", "900")
+        ),
+        tts_chunk_retry_count=int(os.getenv("TTS_CHUNK_RETRY_COUNT", "1")),
+        tts_temp_dir=os.getenv("TTS_TEMP_DIR", "").strip(),
+        tts_cleanup_temp_files=_as_bool("TTS_CLEANUP_TEMP_FILES", "true"),
         posthog_api_key=os.getenv("POSTHOG_API_KEY", "").strip(),
         posthog_project_id=os.getenv("POSTHOG_PROJECT_ID", "").strip(),
         posthog_host=os.getenv("POSTHOG_HOST", "https://app.posthog.com").strip(),

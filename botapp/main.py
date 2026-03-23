@@ -27,7 +27,11 @@ from botapp.extractors.url_text import extract_url
 from botapp.llm.service import ArticleLLMService
 from botapp.llm.yandex_client import YandexLLMClient
 from botapp.tts.factory import make_tts_provider
-from botapp.utils.text import split_text_into_chunks
+from botapp.tts.pipeline import (
+    TTSProgressEvent,
+    TTSPipeline,
+    TTSPipelineConfig,
+)
 
 
 logging.basicConfig(level=logging.INFO)
@@ -209,6 +213,32 @@ def _resolve_tts_chunk_size(text: str) -> int:
     if chunk_size <= 0:
         raise ValueError("MAX_CHARS_PER_CHUNK must be > 0")
     return min(len(text), chunk_size) if text else chunk_size
+
+
+def _make_tts_pipeline(
+    progress_callback: Callable[[TTSProgressEvent], Awaitable[None]] | None = None,
+) -> TTSPipeline:
+    config = TTSPipelineConfig.from_limits(
+        max_chars_per_chunk=settings.max_chars_per_chunk,
+        max_sentences_per_chunk=settings.max_sentences_per_chunk,
+        max_words_per_chunk=settings.max_words_per_chunk,
+        min_chars_per_chunk=settings.min_chars_per_chunk,
+        retry_count=settings.tts_chunk_retry_count,
+        per_chunk_timeout_seconds=settings.tts_chunk_timeout_seconds,
+        overall_timeout_seconds=settings.tts_overall_timeout_seconds,
+        temp_dir=settings.tts_temp_dir or None,
+        cleanup_temp_files=settings.tts_cleanup_temp_files,
+    )
+    return TTSPipeline(
+        provider=tts_provider,
+        config=config,
+        progress_callback=progress_callback,
+        timeout_runner=lambda operation, timeout_seconds, stage: _run_with_timeout(
+            operation,
+            timeout_seconds=timeout_seconds,
+            step=stage,
+        ),
+    )
 
 
 def _distinct_id(message: Message) -> str:
@@ -465,83 +495,63 @@ async def _generate_and_send_audio(
             },
         )
 
-        tts_chunk_size = _resolve_tts_chunk_size(text)
-        chunks = split_text_into_chunks(text, tts_chunk_size)
-        logger.info(
-            "tts start: source=%s text_chars=%s chunk_size=%s chunks=%s",
-            resolved_source,
-            len(text),
-            tts_chunk_size,
-            len(chunks),
-        )
-        if not chunks:
-            status_message = await safe_update_status(
-                status_message=status_message,
-                text="Текст пустой после обработки.",
-                fallback_message_source=message,
-            )
-            await event_logger.capture(
-                event="error_occurred",
-                distinct_id=_distinct_id(message),
-                properties={
-                    "error_type": "EmptyChunks",
-                    "step": "split_text",
-                    "source": resolved_source,
-                },
-            )
-            return
-
         with tempfile.TemporaryDirectory() as tmpdir:
             out_path = Path(tmpdir) / "speech.mp3"
-            with out_path.open("wb") as output_file:
-                for idx, chunk in enumerate(chunks, start=1):
-                    chunk_started_at = time.monotonic()
-                    logger.info(
-                        "tts chunk start: chunk=%s/%s chars=%s",
-                        idx,
-                        len(chunks),
-                        len(chunk),
-                    )
-                    status_message = await safe_update_status(
-                        status_message=status_message,
-                        text=f"Синтез {idx}/{len(chunks)}...",
-                        fallback_message_source=message,
-                    )
-                    try:
-                        audio_part = await _run_with_timeout(
-                            tts_provider.synthesize(chunk),
-                            timeout_seconds=settings.tts_chunk_timeout_seconds,
-                            step=f"tts chunk {idx}/{len(chunks)}",
-                        )
-                    except Exception:
-                        logger.exception(
-                            "tts chunk failed: chunk=%s/%s chars=%s",
-                            idx,
-                            len(chunks),
-                            len(chunk),
-                        )
-                        raise
-                    output_file.write(audio_part)
-                    logger.info(
-                        "tts chunk completed: chunk=%s/%s chars=%s audio_bytes=%s duration_sec=%.3f",
-                        idx,
-                        len(chunks),
-                        len(chunk),
-                        len(audio_part),
-                        time.monotonic() - chunk_started_at,
-                    )
-                    del audio_part
 
+            async def _on_tts_progress(event: TTSProgressEvent) -> None:
+                nonlocal status_message
+                status_message = await safe_update_status(
+                    status_message=status_message,
+                    text=event.message,
+                    fallback_message_source=message,
+                )
+
+            pipeline = _make_tts_pipeline(progress_callback=_on_tts_progress)
+
+            logger.info(
+                "tts pipeline start: source=%s text_chars=%s chunk_char_limit=%s sentence_limit=%s word_limit=%s",
+                resolved_source,
+                len(text),
+                settings.max_chars_per_chunk,
+                settings.max_sentences_per_chunk,
+                settings.max_words_per_chunk,
+            )
+            try:
+                chunk_paths = await pipeline.synthesize_to_file(text, out_path)
+            except ValueError:
+                status_message = await safe_update_status(
+                    status_message=status_message,
+                    text="Текст пустой после обработки.",
+                    fallback_message_source=message,
+                )
+                await event_logger.capture(
+                    event="error_occurred",
+                    distinct_id=_distinct_id(message),
+                    properties={
+                        "error_type": "EmptyChunks",
+                        "step": "split_text",
+                        "source": resolved_source,
+                    },
+                )
+                return
             output_size = out_path.stat().st_size
             logger.info(
                 "tts completed: chunks=%s output_bytes=%s",
-                len(chunks),
+                len(chunk_paths),
                 output_size,
             )
             logger.info(
                 "audio merge completed: chunks=%s output_bytes=%s",
-                len(chunks),
+                len(chunk_paths),
                 output_size,
+            )
+            status_message = await safe_update_status(
+                status_message=status_message,
+                text="Отправляю аудио в Telegram...",
+                fallback_message_source=message,
+            )
+            logger.info(
+                "tts pipeline progress: stage=send_audio source=%s", resolved_source
             )
             logger.info(
                 "telegram send audio start: output_bytes=%s source=%s",
@@ -559,7 +569,7 @@ async def _generate_and_send_audio(
                             ),
                         ),
                         timeout_seconds=settings.telegram_api_timeout_seconds,
-                        step="telegram send audio",
+                        step="send_audio",
                     ),
                     retries=settings.telegram_api_retries,
                 )
@@ -609,7 +619,7 @@ async def _generate_and_send_audio(
             "pipeline completed successfully: source=%s chars=%s chunks=%s duration_sec=%.3f",
             resolved_source,
             len(text),
-            len(chunks),
+            len(chunk_paths),
             time.perf_counter() - started_at,
         )
 
@@ -617,7 +627,7 @@ async def _generate_and_send_audio(
         logger.exception("Failed to generate audio")
         error_text = (
             exc.user_message
-            if isinstance(exc, UserVisibleError)
+            if hasattr(exc, "user_message")
             else f"Ошибка: {type(exc).__name__}: {exc}"
         )
         await event_logger.capture(
