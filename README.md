@@ -171,14 +171,13 @@ rm -rf .venv ~/.cache/pip
 
 ## Надёжность TTS (Silero + fallback)
 
-- Silero предзагружается на старте приложения (`tts_provider.preload()`), а не в момент пользовательского запроса.
-- По умолчанию репозиторий модели хранится в `~/.cache/audio-generator-bot/silero-models` (можно переопределить `SILERO_REPO_DIR`).
-- Если репозиторий отсутствует, он может быть скачан **один раз на старте** (`SILERO_ALLOW_DOWNLOAD_ON_STARTUP=true`).
-- Во время обработки сообщений используется только уже загруженная модель; runtime-загрузка через `torch.hub` из сети не требуется.
-- Если primary TTS падает, включается fallback-провайдер. Если fallback тоже недоступен — бот отправит понятную ошибку в чат.
+- Silero по-прежнему подготавливается на старте приложения (`tts_provider.preload()`), но сам synth теперь выполняется в отдельном killable subprocess: таймаут действительно убивает зависший runtime synth, а не только отменяет `await`.
+- По умолчанию репозиторий модели хранится в `~/.cache/audio-generator-bot/silero-models` (можно переопределить `SILERO_REPO_DIR`). Если репозиторий отсутствует, он может быть скачан **один раз на старте** (`SILERO_ALLOW_DOWNLOAD_ON_STARTUP=true`).
+- Основной provider API стал file-based: pipeline пишет chunk'и сразу во временные `.mp3` файлы и больше не держит весь audio chunk как `bytes` в памяти.
+- Если primary Silero timeout'ится или падает, провайдер гарантированно останавливает subprocess и переключается на fallback для остатка работы; fallback не запускается параллельно с подвисшим primary.
 - По умолчанию входной текст для TTS больше не обрезается: `MAX_INPUT_CHARS=0` означает отсутствие лимита, а длинные тексты идут в озвучку по chunk'ам.
-- По умолчанию бот теперь режет текст для TTS на более короткие chunk'и (`MAX_CHARS_PER_CHUNK=220`), чтобы фрагменты длиннее ~200 символов не уходили одним рискованным запросом в синтезатор.
-- Для зависающих вызовов синтеза есть отдельный таймаут `TTS_CHUNK_TIMEOUT_SECONDS` (по умолчанию 45 секунд): бот быстрее прерывает проблемный chunk и отправляет пользователю понятную ошибку вместо пустого `TimeoutError`.
+- Консервативные дефолты для слабой VM: `MAX_CHARS_PER_CHUNK=160`, `MAX_SENTENCES_PER_CHUNK=2`, `MAX_WORDS_PER_CHUNK=35`, `MIN_CHARS_PER_CHUNK=60`, `TTS_CHUNK_TIMEOUT_SECONDS=45`, `TTS_CHUNK_RETRY_COUNT=0`, `TTS_MAX_CONCURRENT_JOBS=1`, `TTS_MAX_CONCURRENT_SYNTHS=1`, `LOCAL_TTS_STRICT_MODE=true`.
+- При дефиците ресурсов бот показывает статус ожидания свободного TTS slot'а и логирует lightweight telemetry: текущий/peak RSS, usage временной директории, количество chunk-файлов, active jobs/synths и длительности стадий.
 
 ### Полезные логи
 

@@ -10,7 +10,9 @@ import tempfile
 import time
 from typing import Awaitable, Callable
 
-from .base import TTSProvider
+from botapp.runtime_metrics import TTSRuntimeTracker
+
+from .base import TTSProvider, TTSProviderTimeoutError
 from .chunking import (
     ChunkLimits,
     ChunkPlan,
@@ -175,19 +177,21 @@ class TTSPipeline:
         provider: TTSProvider,
         config: TTSPipelineConfig,
         progress_callback: Callable[[TTSProgressEvent], Awaitable[None]] | None = None,
-        timeout_runner: Callable[[Awaitable[bytes], int, str], Awaitable[bytes]]
-        | None = None,
+        synth_semaphore: asyncio.Semaphore | None = None,
+        runtime_tracker: TTSRuntimeTracker | None = None,
     ) -> None:
         self._provider = provider
         self._config = config
         self._config.validate()
         self._chunker = HierarchicalTextChunker(self._config.chunk_plans)
         self._progress_callback = progress_callback
-        self._timeout_runner = timeout_runner or self._default_timeout_runner
+        self._synth_semaphore = synth_semaphore
+        self._runtime_tracker = runtime_tracker or TTSRuntimeTracker()
 
     async def synthesize_to_file(self, text: str, destination: Path) -> list[Path]:
         normalized_text = normalize_tts_text(text)
         deadline = time.monotonic() + self._config.overall_timeout_seconds
+        job_started_at = time.monotonic()
         await self._progress("prepare_text", "Подготавливаю текст к озвучке...")
         self._check_deadline(deadline, "prepare_text")
 
@@ -212,6 +216,17 @@ class TTSPipeline:
         temp_ctx = tempfile.TemporaryDirectory(dir=self._config.temp_dir)
         try:
             work_dir = Path(temp_ctx.name)
+            logger.info(
+                "tts job start: destination=%s chars=%s chunks=%s metrics=%s",
+                destination,
+                len(normalized_text),
+                len(chunks),
+                self._runtime_tracker.snapshot(
+                    work_dir=work_dir,
+                    chunk_paths=chunk_paths,
+                    started_at=job_started_at,
+                ),
+            )
             for chunk_index, chunk in enumerate(chunks, start=1):
                 self._check_deadline(deadline, f"tts_chunk_{chunk_index}_{len(chunks)}")
                 chunk_paths.extend(
@@ -222,20 +237,45 @@ class TTSPipeline:
                         level_index=0,
                         work_dir=work_dir,
                         deadline=deadline,
+                        chunk_paths=chunk_paths,
+                        job_started_at=job_started_at,
                     )
                 )
 
             await self._progress("merge_audio", "Собираю итоговый аудиофайл...")
             self._check_deadline(deadline, "merge_audio")
+            logger.info(
+                "tts before merge: destination=%s metrics=%s",
+                destination,
+                self._runtime_tracker.snapshot(
+                    work_dir=work_dir,
+                    chunk_paths=chunk_paths,
+                    started_at=job_started_at,
+                ),
+            )
             self._merge_audio_files(chunk_paths, destination)
             logger.info(
-                "tts pipeline merge completed: temp_chunks=%s destination=%s bytes=%s",
+                "tts pipeline merge completed: temp_chunks=%s destination=%s bytes=%s metrics=%s",
                 len(chunk_paths),
                 destination,
                 destination.stat().st_size if destination.exists() else 0,
+                self._runtime_tracker.snapshot(
+                    work_dir=work_dir,
+                    chunk_paths=chunk_paths,
+                    started_at=job_started_at,
+                ),
             )
             await self._progress("finalize_audio", "Финализирую аудиофайл...")
             self._check_deadline(deadline, "finalize_audio")
+            logger.info(
+                "tts job completed: destination=%s metrics=%s",
+                destination,
+                self._runtime_tracker.snapshot(
+                    work_dir=work_dir,
+                    chunk_paths=chunk_paths,
+                    started_at=job_started_at,
+                ),
+            )
             return chunk_paths
         finally:
             if self._config.cleanup_temp_files:
@@ -252,6 +292,8 @@ class TTSPipeline:
         level_index: int,
         work_dir: Path,
         deadline: float,
+        chunk_paths: list[Path],
+        job_started_at: float,
     ) -> list[Path]:
         progress_stage = f"tts_chunk_{chunk_index}_{chunk_total}"
         timeout_stage = f"tts chunk {chunk_index}/{chunk_total}"
@@ -265,28 +307,44 @@ class TTSPipeline:
                 chunk_index=chunk_index,
                 chunk_total=chunk_total,
             )
+            chunk_path = (
+                work_dir / f"chunk_{chunk_index:04d}_{level_index}_{attempt}.mp3"
+            )
             try:
                 started_at = time.monotonic()
-                audio_bytes = await self._timeout_runner(
-                    self._provider.synthesize(text),
-                    self._config.per_chunk_timeout_seconds,
-                    timeout_stage,
-                )
-                chunk_path = (
-                    work_dir / f"chunk_{chunk_index:04d}_{level_index}_{attempt}.mp3"
-                )
-                chunk_path.write_bytes(audio_bytes)
                 logger.info(
-                    "tts chunk completed: chunk=%s/%s level=%s attempt=%s chars=%s audio_bytes=%s duration_sec=%.3f",
+                    "tts before synth: chunk=%s/%s level=%s attempt=%s chars=%s metrics=%s",
                     chunk_index,
                     chunk_total,
                     self._chunker.plan_name(level_index),
                     attempt,
                     len(text),
-                    len(audio_bytes),
-                    time.monotonic() - started_at,
+                    self._runtime_tracker.snapshot(
+                        work_dir=work_dir,
+                        chunk_paths=chunk_paths,
+                        started_at=job_started_at,
+                    ),
                 )
-                del audio_bytes
+                await self._run_synth(
+                    text=text,
+                    destination=chunk_path,
+                    timeout_seconds=self._config.per_chunk_timeout_seconds,
+                )
+                logger.info(
+                    "tts chunk completed: chunk=%s/%s level=%s attempt=%s chars=%s audio_bytes=%s duration_sec=%.3f metrics=%s",
+                    chunk_index,
+                    chunk_total,
+                    self._chunker.plan_name(level_index),
+                    attempt,
+                    len(text),
+                    chunk_path.stat().st_size if chunk_path.exists() else 0,
+                    time.monotonic() - started_at,
+                    self._runtime_tracker.snapshot(
+                        work_dir=work_dir,
+                        chunk_paths=chunk_paths + [chunk_path],
+                        started_at=job_started_at,
+                    ),
+                )
                 await self._progress(
                     progress_stage,
                     f"Готово: чанк {chunk_index}/{chunk_total} синтезирован.",
@@ -294,7 +352,63 @@ class TTSPipeline:
                     chunk_total=chunk_total,
                 )
                 return [chunk_path]
+            except TTSProviderTimeoutError as exc:
+                if chunk_path.exists():
+                    chunk_path.unlink()
+                logger.warning(
+                    "tts chunk timeout: chunk=%s/%s level=%s attempt=%s chars=%s preview=%s metrics=%s",
+                    chunk_index,
+                    chunk_total,
+                    self._chunker.plan_name(level_index),
+                    attempt,
+                    len(text),
+                    preview,
+                    self._runtime_tracker.snapshot(
+                        work_dir=work_dir,
+                        chunk_paths=chunk_paths,
+                        started_at=job_started_at,
+                    ),
+                )
+                retry_chunks = self._chunker.split_for_retry(text, level_index)
+                if retry_chunks:
+                    logger.info(
+                        "tts chunk fallback split: chunk=%s/%s from_level=%s to_level=%s parts=%s metrics=%s",
+                        chunk_index,
+                        chunk_total,
+                        self._chunker.plan_name(level_index),
+                        self._chunker.plan_name(level_index + 1),
+                        len(retry_chunks),
+                        self._runtime_tracker.snapshot(
+                            work_dir=work_dir,
+                            chunk_paths=chunk_paths,
+                            started_at=job_started_at,
+                        ),
+                    )
+                    nested_paths: list[Path] = []
+                    for nested_index, nested_chunk in enumerate(retry_chunks, start=1):
+                        nested_paths.extend(
+                            await self._synthesize_chunk_tree(
+                                text=nested_chunk,
+                                chunk_index=nested_index,
+                                chunk_total=len(retry_chunks),
+                                level_index=level_index + 1,
+                                work_dir=work_dir,
+                                deadline=deadline,
+                                chunk_paths=chunk_paths + nested_paths,
+                                job_started_at=job_started_at,
+                            )
+                        )
+                    return nested_paths
+                raise TTSPipelineError(
+                    stage=timeout_stage,
+                    chunk_index=chunk_index,
+                    chunk_total=chunk_total,
+                    text_preview=preview,
+                    root_exception=exc,
+                ) from exc
             except Exception as exc:
+                if chunk_path.exists():
+                    chunk_path.unlink()
                 logger.warning(
                     "tts chunk attempt failed: chunk=%s/%s level=%s attempt=%s chars=%s preview=%s error=%s: %s",
                     chunk_index,
@@ -311,12 +425,17 @@ class TTSPipeline:
                 retry_chunks = self._chunker.split_for_retry(text, level_index)
                 if retry_chunks:
                     logger.info(
-                        "tts chunk fallback split: chunk=%s/%s from_level=%s to_level=%s parts=%s",
+                        "tts chunk fallback split: chunk=%s/%s from_level=%s to_level=%s parts=%s metrics=%s",
                         chunk_index,
                         chunk_total,
                         self._chunker.plan_name(level_index),
                         self._chunker.plan_name(level_index + 1),
                         len(retry_chunks),
+                        self._runtime_tracker.snapshot(
+                            work_dir=work_dir,
+                            chunk_paths=chunk_paths,
+                            started_at=job_started_at,
+                        ),
                     )
                     nested_paths: list[Path] = []
                     for nested_index, nested_chunk in enumerate(retry_chunks, start=1):
@@ -328,6 +447,8 @@ class TTSPipeline:
                                 level_index=level_index + 1,
                                 work_dir=work_dir,
                                 deadline=deadline,
+                                chunk_paths=chunk_paths + nested_paths,
+                                job_started_at=job_started_at,
                             )
                         )
                     return nested_paths
@@ -339,6 +460,30 @@ class TTSPipeline:
                     root_exception=exc,
                 ) from exc
         raise AssertionError("unreachable")
+
+    async def _run_synth(
+        self,
+        *,
+        text: str,
+        destination: Path,
+        timeout_seconds: int,
+    ) -> None:
+        if self._synth_semaphore is None:
+            async with self._runtime_tracker.track_synth():
+                await self._provider.synthesize_to_file(
+                    text,
+                    destination,
+                    timeout_seconds=timeout_seconds,
+                )
+            return
+
+        async with self._synth_semaphore:
+            async with self._runtime_tracker.track_synth():
+                await self._provider.synthesize_to_file(
+                    text,
+                    destination,
+                    timeout_seconds=timeout_seconds,
+                )
 
     def _merge_audio_files(self, chunk_paths: list[Path], destination: Path) -> None:
         if not chunk_paths:
@@ -407,14 +552,6 @@ class TTSPipeline:
     def _check_deadline(self, deadline: float, stage: str) -> None:
         if time.monotonic() > deadline:
             raise TTSOverallTimeoutError(stage, self._config.overall_timeout_seconds)
-
-    async def _default_timeout_runner(
-        self,
-        operation: Awaitable[bytes],
-        timeout_seconds: int,
-        stage: str,
-    ) -> bytes:
-        return await asyncio.wait_for(operation, timeout=timeout_seconds)
 
     def _preview(self, text: str, limit: int = 80) -> str:
         normalized = normalize_tts_text(text)
